@@ -149,6 +149,9 @@ def rebuild_hand(replay: dict[str, Any]) -> HandState:
         state.step(record["action"])
     if not state.complete:
         raise ValueError("replay does not contain a completed hand")
-    if state.replay() != replay:
+    # Player-mode replays intentionally omit opponent cards, but retain seed
+    # and action log, which are enough for deterministic reconstruction.
+    reveal_hole_cards = all("hole_cards" in player for player in replay.get("players", []))
+    if state.replay(reveal_hole_cards=reveal_hole_cards) != replay:
         raise ValueError("replay result does not match deterministic reconstruction")
     return state

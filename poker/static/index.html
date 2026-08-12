@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pokerface — наблюдаемый стол</title>
+    <link rel="stylesheet" href="/static.css">
+  </head>
+  <body>
+    <header>
+      <h1>Pokerface <small>наблюдаемый 5-max стол</small></h1>
+      <div class="controls">
+        <label>Режим <select id="mode"><option value="player">игрок</option><option value="spectator">наблюдатель</option></select></label>
+        <label>Место героя <select id="hero"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+        <label>Seed <input id="seed" type="number" placeholder="случайный"></label>
+        <button id="start">Новая раздача</button>
+        <label class="file">Импорт replay <input id="replay-file" type="file" accept="application/json"></label>
+      </div>
+      <p id="status" aria-live="polite">Соединение…</p>
+    </header>
+    <main>
+      <section class="table-panel" aria-label="Покерный стол">
+        <div id="table" class="table">
+          <div class="pot">Банк <strong id="pot">—</strong><span id="street">—</span></div>
+          <div id="board" class="board" aria-label="Общие карты"></div>
+          <div id="seats"></div>
+        </div>
+      </section>
+      <aside class="inspector">
+        <section>
+          <h2>Решение модели</h2>
+          <p id="selected-action">Ожидание действия</p>
+          <dl><dt>Value</dt><dd id="value">—</dd><dt>Equity</dt><dd id="equity">—</dd></dl>
+          <h3>Действия</h3><div id="action-probs" class="bars"></div>
+          <h3>Размер рейза</h3><div id="size-probs" class="bars"></div>
+        </section>
+        <section>
+          <h2>Equity героя</h2>
+          <svg id="equity-graph" viewBox="0 0 320 130" role="img" aria-label="График equity"></svg>
+          <div id="equity-labels" class="muted"></div>
+        </section>
+        <section><h2>История действий</h2><ol id="history"></ol></section>
+      </aside>
+    </main>
+    <template id="seat-template"><article class="seat"><b class="position"></b><span class="chips"></span><div class="cards"></div><small class="state"></small></article></template>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -39,6 +39,8 @@ from .model import (
     ModelOutput,
     PokerAgentModel,
 )
+from .inference import CheckpointInferenceService, HeuristicInferenceService, InferenceResponse
+from .game_server import GameServer, ObservableHand
 from .curriculum import (
     CheckpointTransfer,
     CurriculumConfig,
@@ -67,6 +69,7 @@ __all__ = [
     "BatchedHoldemEnvironment",
     "BatchStep",
     "Card",
+    "CheckpointInferenceService",
     "CheckpointTransfer",
     "CurriculumConfig",
     "CurriculumStage",
@@ -83,12 +86,16 @@ __all__ = [
     "EquitySnapshot",
     "EquityTarget",
     "HandState",
+    "GameServer",
+    "HeuristicInferenceService",
     "HoldemEnvironment",
     "OBSERVATION_VERSION",
     "MODEL_VERSION",
     "Observation",
     "ObservationFeatureStatistics",
+    "ObservableHand",
     "InferenceDecision",
+    "InferenceResponse",
     "ModelConfig",
     "ModelDiagnostics",
     "ModelOutput",

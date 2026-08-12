@@ -38,3 +38,37 @@ Game server общается с клиентом через WebSocket: это п
 ## Критерий приёмки
 
 Одна сохранённая раздача точно воспроизводится в браузере; отображаемые данные соответствуют состоянию и ответу inference-сервиса.
+
+## Реализация и запуск
+
+Реализация разделена на три слоя:
+
+```text
+poker.inference     fixed checkpoint -> InferenceResponse
+poker.game_server   state machine + serialisable observer/replay events
+poker.web           optional FastAPI HTTP/WebSocket adapter + static browser UI
+```
+
+Для запуска UI установите optional web-зависимости и передайте ASGI-приложение
+в Uvicorn:
+
+```bash
+.venv/bin/pip install -e '.[web]'
+.venv/bin/uvicorn poker.web:create_app --factory --reload
+```
+
+После запуска откройте `http://127.0.0.1:8000`. Браузер посылает в
+`/ws/table` команды `start_hand` или `replay` и получает отдельные сообщения
+`hand_started`, `action`, `hand_complete`. REST-вариант для интеграций —
+`POST /api/hand`, health check — `GET /api/health`.
+
+По умолчанию используется `HeuristicInferenceService`, чтобы UI был пригоден
+сразу после checkout. Это не обученная модель и его equity — только proxy
+силы руки. Для реальной модели создайте `GameServer` с
+`CheckpointInferenceService.from_checkpoint(path)` и передайте его в
+`create_app`; сервис читает checkpoint, но никогда его не меняет.
+
+В player-mode чужие карты не отправляются ни во время, ни после раздачи.
+Spectator-mode раскрывает все карты только в terminal snapshot. Оба replay
+содержат seed и action log и потому детерминированно импортируются обратно;
+player replay при этом не требует раскрывать карты соперников.
