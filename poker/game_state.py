@@ -340,6 +340,7 @@ class HandState:
         return {
             "seed": self.seed,
             "button_seat": self.button_seat,
+            "starting_stack": self.starting_stack,
             "street": self.street.value,
             "board": [str(card) for card in self.board],
             "players": players,
