@@ -26,6 +26,7 @@ class ActionRecord:
     street: Street
     seat: int
     action: Action
+    pot_before: int
     amount: int
     raise_to: int | None
     current_bet_after: int
@@ -35,6 +36,7 @@ class ActionRecord:
             "street": self.street.value,
             "seat": self.seat,
             "action": self.action.value,
+            "pot_before": self.pot_before,
             "amount": self.amount,
             "raise_to": self.raise_to,
             "current_bet_after": self.current_bet_after,
@@ -146,6 +148,7 @@ class HandState:
         seat = self.actor
         player = self.player(seat)
         old_current = self.current_bet
+        pot_before = self.pot
         amount = 0
         target: int | None = None
         if action == Action.FOLD:
@@ -161,7 +164,7 @@ class HandState:
             self._commit(seat, amount)
             self.current_bet = target
         self._raise_right[seat] = False
-        self.action_history.append(ActionRecord(self.street, seat, action, amount, target, self.current_bet))
+        self.action_history.append(ActionRecord(self.street, seat, action, pot_before, amount, target, self.current_bet))
         self._after_action(seat, old_current)
         self._assert_invariants()
 
