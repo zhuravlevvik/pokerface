@@ -56,15 +56,19 @@ class BatchedHoldemEnvironment:
         player_count: int = 5,
         allowed_raise_actions: frozenset[Action] | None = None,
         capture_replays: bool = False,
+        equity_samples: int = 16,
     ) -> None:
         if table_count < 1:
             raise ValueError("table_count must be positive")
+        if equity_samples < 1:
+            raise ValueError("equity_samples must be positive")
         self.table_count = table_count
         self.button_seat = button_seat
         self.starting_stack = starting_stack
         self.player_count = player_count
         self.allowed_raise_actions = allowed_raise_actions
         self.capture_replays = capture_replays
+        self.equity_samples = equity_samples
         self.states: list[HandState] = []
         self._traces: list[HandTrace] = []
         self._hand_counter = 0
@@ -77,6 +81,17 @@ class BatchedHoldemEnvironment:
     @property
     def rewards(self) -> tuple[dict[int, float], ...]:
         return tuple(dict(reward) for reward in self._rewards)
+
+    @property
+    def traces(self) -> tuple[HandTrace, ...]:
+        """Training traces for the currently dealt hands.
+
+        Callers may use the public decision order to join an on-policy sample
+        to its terminal virtual-showdown label.  The trace's private snapshots
+        remain encapsulated and are never part of player observations.
+        """
+
+        return tuple(self._traces)
 
     @property
     def legal_action_masks(self) -> tuple[dict[str, bool], ...]:
@@ -100,6 +115,7 @@ class BatchedHoldemEnvironment:
                 seed=seed,
                 button_seat=self.button_seat,
                 starting_stack=self.starting_stack,
+                equity_samples=self.equity_samples,
             )
             self._hand_counter += 1
             self.states.append(state)
