@@ -138,6 +138,10 @@ def rebuild_hand(replay: dict[str, Any]) -> HandState:
         seed=replay["seed"],
         button_seat=replay["button_seat"],
         starting_stack=replay.get("starting_stack", 10_000),
+        player_count=replay.get("player_count", 5),
+        allowed_raise_actions=None
+        if replay.get("allowed_raise_actions") is None
+        else frozenset(Action(value) for value in replay["allowed_raise_actions"]),
     )
     for record in replay["actions"]:
         if state.actor != record["seat"]:

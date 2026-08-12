@@ -45,11 +45,13 @@ class ActionRecord:
 
 @dataclass
 class HandState:
-    """One complete cash-game hand; all money amounts are integer chips."""
+    """One complete 2--5 player cash-game hand; money is integer chips."""
 
     seed: int | None = None
     button_seat: int = 0
     starting_stack: int = 10_000
+    player_count: int = SEAT_COUNT
+    allowed_raise_actions: frozenset[Action] | None = None
     deck: Deck = field(init=False)
     players: list[PlayerState] = field(init=False)
     hole_cards: dict[int, tuple[Card, Card]] = field(init=False)
@@ -65,17 +67,25 @@ class HandState:
     _raise_right: dict[int, bool] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
-        if not 0 <= self.button_seat < SEAT_COUNT:
-            raise ValueError("button seat must be in 0..4")
+        if not 2 <= self.player_count <= SEAT_COUNT:
+            raise ValueError(f"player_count must be in 2..{SEAT_COUNT}")
+        if not 0 <= self.button_seat < self.player_count:
+            raise ValueError(f"button seat must be in 0..{self.player_count - 1}")
         if self.starting_stack < BIG_BLIND:
             raise ValueError("starting stack must cover the big blind")
+        if self.allowed_raise_actions is not None and not self.allowed_raise_actions.issubset(RAISE_ACTIONS | {Action.ALL_IN}):
+            raise ValueError("allowed_raise_actions contains a non-raise action")
         self.deck = Deck(self.seed)
-        self.players = [PlayerState(seat=seat, stack=self.starting_stack) for seat in range(SEAT_COUNT)]
-        self.hole_cards = {seat: tuple(self.deck.deal(2)) for seat in range(SEAT_COUNT)}
-        self.payouts = {seat: 0 for seat in range(SEAT_COUNT)}
-        self._commit((self.button_seat + 1) % SEAT_COUNT, SMALL_BLIND)
-        self._commit((self.button_seat + 2) % SEAT_COUNT, BIG_BLIND)
-        self._start_betting_round(preflop_order(self.button_seat), reset_bet=False)
+        self.players = [PlayerState(seat=seat, stack=self.starting_stack) for seat in range(self.player_count)]
+        self.hole_cards = {seat: tuple(self.deck.deal(2)) for seat in range(self.player_count)}
+        self.payouts = {seat: 0 for seat in range(self.player_count)}
+        if self.player_count == 2:
+            self._commit(self.button_seat, SMALL_BLIND)
+            self._commit((self.button_seat + 1) % self.player_count, BIG_BLIND)
+        else:
+            self._commit((self.button_seat + 1) % self.player_count, SMALL_BLIND)
+            self._commit((self.button_seat + 2) % self.player_count, BIG_BLIND)
+        self._start_betting_round(preflop_order(self.button_seat, player_count=self.player_count), reset_bet=False)
         self._assert_invariants()
 
     @property
@@ -84,7 +94,7 @@ class HandState:
 
     @property
     def positions(self) -> dict[int, str]:
-        return positions(self.button_seat)
+        return positions(self.button_seat, player_count=self.player_count)
 
     @property
     def complete(self) -> bool:
@@ -114,10 +124,11 @@ class HandState:
         result[Action.CHECK] = to_call == 0
         result[Action.CALL] = to_call > 0
         all_in_to = player.committed_street + player.stack
-        result[Action.ALL_IN] = player.stack > to_call and all_in_to > self.current_bet
+        result[Action.ALL_IN] = (self.allowed_raise_actions is None or Action.ALL_IN in self.allowed_raise_actions) and player.stack > to_call and all_in_to > self.current_bet
         if not self._raise_right[seat]:
             return result
-        for action in RAISE_ACTIONS:
+        permitted = RAISE_ACTIONS if self.allowed_raise_actions is None else RAISE_ACTIONS.intersection(self.allowed_raise_actions)
+        for action in permitted:
             target = self.raise_to(action, seat)
             contribution = target - player.committed_street
             # Exact stack sized bets use the all-in id, avoiding duplicate actions.
@@ -178,7 +189,7 @@ class HandState:
         full_raise = raised and self.current_bet - old_current >= self.last_full_raise
         if full_raise:
             self.last_full_raise = self.current_bet - old_current
-            self._raise_right = {candidate: candidate != seat and self._can_act(candidate) for candidate in range(SEAT_COUNT)}
+            self._raise_right = {candidate: candidate != seat and self._can_act(candidate) for candidate in range(self.player_count)}
         # A bet/raise requires every undercalled player to respond. A short
         # all-in intentionally does not reopen their raise rights.
         if raised:
@@ -193,7 +204,7 @@ class HandState:
                 player.committed_street = 0
             self.current_bet = 0
             self.last_full_raise = BIG_BLIND
-        self._raise_right = {seat: self._can_act(seat) for seat in range(SEAT_COUNT)}
+        self._raise_right = {seat: self._can_act(seat) for seat in range(self.player_count)}
         self._awaiting = [seat for seat in order if self._can_act(seat)]
         self._select_next_or_advance()
 
@@ -229,7 +240,7 @@ class HandState:
             return
         else:
             raise RuntimeError(f"cannot finish street {self.street}")
-        self._start_betting_round(postflop_order(self.button_seat), reset_bet=True)
+        self._start_betting_round(postflop_order(self.button_seat, player_count=self.player_count), reset_bet=True)
 
     def _runout_and_showdown(self) -> None:
         if self.street == Street.PREFLOP:
@@ -308,20 +319,20 @@ class HandState:
         return not player.folded and not player.all_in
 
     def _ordered_after(self, seat: int) -> list[int]:
-        return [((seat + offset) % SEAT_COUNT) for offset in range(1, SEAT_COUNT)]
+        return [((seat + offset) % self.player_count) for offset in range(1, self.player_count)]
 
     def _clockwise_from_button(self, candidates: list[int]) -> list[int]:
         candidate_set = set(candidates)
-        return [((self.button_seat + offset) % SEAT_COUNT) for offset in range(1, SEAT_COUNT + 1) if ((self.button_seat + offset) % SEAT_COUNT) in candidate_set]
+        return [((self.button_seat + offset) % self.player_count) for offset in range(1, self.player_count + 1) if ((self.button_seat + offset) % self.player_count) in candidate_set]
 
     def _assert_invariants(self) -> None:
         all_cards = [card for cards in self.hole_cards.values() for card in cards] + self.board + list(self.deck.snapshot())
         assert len(all_cards) == 52 and len(set(all_cards)) == 52, "cards must partition the deck"
         assert all(player.stack >= 0 and player.committed_total >= 0 and player.committed_street >= 0 for player in self.players)
         if self.complete:
-            assert sum(player.stack for player in self.players) == self.starting_stack * SEAT_COUNT
+            assert sum(player.stack for player in self.players) == self.starting_stack * self.player_count
         else:
-            assert sum(player.stack for player in self.players) + self.pot == self.starting_stack * SEAT_COUNT
+            assert sum(player.stack for player in self.players) + self.pot == self.starting_stack * self.player_count
 
     def replay(self, *, reveal_hole_cards: bool = True) -> dict[str, Any]:
         """Stable, JSON-serialisable audit record for this hand."""
@@ -344,6 +355,8 @@ class HandState:
             "seed": self.seed,
             "button_seat": self.button_seat,
             "starting_stack": self.starting_stack,
+            "player_count": self.player_count,
+            "allowed_raise_actions": None if self.allowed_raise_actions is None else sorted(action.value for action in self.allowed_raise_actions),
             "street": self.street.value,
             "board": [str(card) for card in self.board],
             "players": players,

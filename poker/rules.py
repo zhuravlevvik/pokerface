@@ -24,19 +24,45 @@ def clockwise_after(seat: int, count: int = SEAT_COUNT) -> int:
     return (seat + 1) % count
 
 
-def positions(button_seat: int) -> dict[int, str]:
-    if not 0 <= button_seat < SEAT_COUNT:
-        raise ValueError("button seat must be in 0..4")
-    names = ("BTN", "SB", "BB", "UTG", "CO")
-    return {(button_seat + offset) % SEAT_COUNT: name for offset, name in enumerate(names)}
+def _validate_player_count(player_count: int) -> None:
+    if not 2 <= player_count <= SEAT_COUNT:
+        raise ValueError(f"player_count must be in 2..{SEAT_COUNT}")
 
 
-def preflop_order(button_seat: int) -> tuple[int, ...]:
-    return tuple((button_seat + offset) % SEAT_COUNT for offset in (3, 4, 0, 1, 2))
+def positions(button_seat: int, *, player_count: int = SEAT_COUNT) -> dict[int, str]:
+    """Return position names for a contiguous 2--5 player cash table.
+
+    Heads-up intentionally follows the standard convention where BTN posts the
+    small blind and acts first preflop.  Seats are renumbered ``0..N-1`` for a
+    short-handed hand; no invisible 5-max placeholders participate in rules.
+    """
+
+    _validate_player_count(player_count)
+    if not 0 <= button_seat < player_count:
+        raise ValueError(f"button seat must be in 0..{player_count - 1}")
+    names = {
+        2: ("BTN", "BB"),
+        3: ("BTN", "SB", "BB"),
+        4: ("BTN", "SB", "BB", "UTG"),
+        5: ("BTN", "SB", "BB", "UTG", "CO"),
+    }[player_count]
+    return {(button_seat + offset) % player_count: name for offset, name in enumerate(names)}
 
 
-def postflop_order(button_seat: int) -> tuple[int, ...]:
-    return tuple((button_seat + offset) % SEAT_COUNT for offset in (1, 2, 3, 4, 0))
+def preflop_order(button_seat: int, *, player_count: int = SEAT_COUNT) -> tuple[int, ...]:
+    _validate_player_count(player_count)
+    if not 0 <= button_seat < player_count:
+        raise ValueError(f"button seat must be in 0..{player_count - 1}")
+    # BTN is first in heads-up; otherwise action starts to the BB's left.
+    start_offset = 0 if player_count == 2 else 3
+    return tuple((button_seat + start_offset + offset) % player_count for offset in range(player_count))
+
+
+def postflop_order(button_seat: int, *, player_count: int = SEAT_COUNT) -> tuple[int, ...]:
+    _validate_player_count(player_count)
+    if not 0 <= button_seat < player_count:
+        raise ValueError(f"button seat must be in 0..{player_count - 1}")
+    return tuple((button_seat + offset) % player_count for offset in range(1, player_count + 1))
 
 
 def round_half_up(value: Fraction) -> int:

@@ -53,6 +53,8 @@ class BatchedHoldemEnvironment:
         *,
         button_seat: int = 0,
         starting_stack: int = 10_000,
+        player_count: int = 5,
+        allowed_raise_actions: frozenset[Action] | None = None,
         capture_replays: bool = False,
     ) -> None:
         if table_count < 1:
@@ -60,6 +62,8 @@ class BatchedHoldemEnvironment:
         self.table_count = table_count
         self.button_seat = button_seat
         self.starting_stack = starting_stack
+        self.player_count = player_count
+        self.allowed_raise_actions = allowed_raise_actions
         self.capture_replays = capture_replays
         self.states: list[HandState] = []
         self._traces: list[HandTrace] = []
@@ -90,7 +94,7 @@ class BatchedHoldemEnvironment:
         self._rewards = [self._zero_rewards() for _ in range(self.table_count)]
         observations: list[dict[str, Any]] = []
         for seed in seeds:
-            state = HandState(seed=seed, button_seat=self.button_seat, starting_stack=self.starting_stack)
+            state = HandState(seed=seed, button_seat=self.button_seat, starting_stack=self.starting_stack, player_count=self.player_count, allowed_raise_actions=self.allowed_raise_actions)
             trace = HandTrace(
                 hand_id=self._hand_counter,
                 seed=seed,
@@ -148,9 +152,8 @@ class BatchedHoldemEnvironment:
             infos=tuple(infos),
         )
 
-    @staticmethod
-    def _zero_rewards() -> dict[int, float]:
-        return {seat: 0.0 for seat in range(5)}
+    def _zero_rewards(self) -> dict[int, float]:
+        return {seat: 0.0 for seat in range(self.player_count)}
 
     @staticmethod
     def _mask(state: HandState) -> dict[str, bool]:
