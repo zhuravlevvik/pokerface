@@ -4,6 +4,16 @@ from .betting import Action, PlayerState, Pot
 from .bots import AggroBot, BotStatistics, CallingStationBot, PokerBot, RandomBot, RuleBot, TightBot
 from .cards import Card, Deck
 from .environment import HoldemEnvironment
+from .equity import (
+    EquityCalibrationBin,
+    EquityMetrics,
+    EquitySnapshot,
+    EquityTarget,
+    capture_equity_snapshot,
+    equity_cross_entropy,
+    equity_metrics,
+    generate_equity_target,
+)
 from .game_state import HandState, Street
 from .observation import OBSERVATION_VERSION, Observation, ObservationFeatureStatistics, observation_for
 from .simulator import BatchedHoldemEnvironment, BatchStep, SimulationBenchmark, benchmark_hands
@@ -32,6 +42,10 @@ __all__ = [
     "CallingStationBot",
     "Deck",
     "EQUITY_OUTCOMES",
+    "EquityCalibrationBin",
+    "EquityMetrics",
+    "EquitySnapshot",
+    "EquityTarget",
     "HandState",
     "HoldemEnvironment",
     "OBSERVATION_VERSION",
@@ -53,6 +67,10 @@ __all__ = [
     "TightBot",
     "TournamentResult",
     "benchmark_hands",
+    "capture_equity_snapshot",
+    "equity_cross_entropy",
+    "equity_metrics",
+    "generate_equity_target",
     "run_tournament",
     "observation_for",
 ]

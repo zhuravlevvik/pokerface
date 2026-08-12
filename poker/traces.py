@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .betting import Action
+from .equity import EquitySnapshot, EquityTarget, capture_equity_snapshot, generate_equity_target
 from .game_state import HandState
 from .observation import observation_for
 from .rules import BIG_BLIND
@@ -38,6 +39,7 @@ class DecisionTrace:
     active_players: list[int]
     terminal_pnl_bb: float | None = None
     equity_snapshot_reference: str | None = None
+    equity_target: list[float] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable copy suitable for a compact dataset."""
@@ -56,6 +58,7 @@ class DecisionTrace:
             "active_players": self.active_players,
             "terminal_pnl_bb": self.terminal_pnl_bb,
             "equity_snapshot_reference": self.equity_snapshot_reference,
+            "equity_target": None if self.equity_target is None else list(self.equity_target),
         }
 
 
@@ -69,6 +72,8 @@ class HandTrace:
     starting_stack: int
     decisions: list[DecisionTrace] = field(default_factory=list)
     terminal_pnl_bb: dict[int, float] | None = None
+    equity_samples: int = 16
+    _equity_snapshots: dict[str, EquitySnapshot] = field(default_factory=dict, init=False, repr=False)
 
     def record_action(self, state: HandState, action: Action | str) -> None:
         """Capture the current actor's legal view before applying ``action``."""
@@ -78,6 +83,8 @@ class HandTrace:
         normalized = Action(action)
         seat = state.actor
         observation = observation_for(state, seat)
+        reference = f"{self.hand_id}:{len(self.decisions)}"
+        self._equity_snapshots[reference] = capture_equity_snapshot(state, seat, reference=reference)
         self.decisions.append(
             DecisionTrace(
                 hand_id=self.hand_id,
@@ -91,6 +98,7 @@ class HandTrace:
                 pot=state.pot,
                 stacks=[player.stack for player in state.players],
                 active_players=[player.seat for player in state.players if not player.folded],
+                equity_snapshot_reference=reference,
             )
         )
 
@@ -104,9 +112,14 @@ class HandTrace:
         self.terminal_pnl_bb = pnl
         for decision in self.decisions:
             decision.terminal_pnl_bb = pnl[decision.hero_seat]
+            reference = decision.equity_snapshot_reference
+            if reference is None:  # Defensive: every trace created here has one.
+                raise RuntimeError("decision has no equity snapshot")
+            target: EquityTarget = generate_equity_target(self._equity_snapshots[reference], samples=self.equity_samples)
+            decision.equity_target = target.as_list()
 
     def as_training_records(self) -> list[dict[str, Any]]:
-        """Return only model-safe decision data; never includes opponents' cards."""
+        """Return model-safe records, including labels but never hidden cards."""
 
         if self.terminal_pnl_bb is None:
             raise RuntimeError("hand trace is not terminal")
