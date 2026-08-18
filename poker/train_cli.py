@@ -12,7 +12,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a resumable poker PPO run")
     parser.add_argument("--config", type=Path, help="JSON or TOML training configuration")
     parser.add_argument("--run-dir", type=Path, default=Path("runs/default"), help="directory containing checkpoints and manifest")
-    parser.add_argument("--resume", nargs="?", const="latest", help="checkpoint path, or `latest` within --run-dir")
+    restore = parser.add_mutually_exclusive_group()
+    restore.add_argument("--resume", nargs="?", const="latest", help="full-run checkpoint path, or `latest` within --run-dir")
+    restore.add_argument("--init-checkpoint", type=Path, help="model/pretraining checkpoint used only to initialize a fresh PPO run")
     parser.add_argument("--iterations", type=int, help="absolute target iteration (overrides config for this invocation)")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu or cuda")
     parser.add_argument("--write-default-config", type=Path, help="write a commented-free JSON starter config and exit")
@@ -25,12 +27,16 @@ def main(argv: list[str] | None = None) -> int:
         write_run_config(TrainingRunConfig(), args.write_default_config)
         print(f"Wrote {args.write_default_config}")
         return 0
+    config = load_run_config(args.config) if args.config is not None else None
     if args.resume:
+        if config is not None and config.init_checkpoint is not None:
+            _parser().error("--resume cannot be combined with config init_checkpoint; resume restores its own full run state")
         checkpoint = args.run_dir / "checkpoints" / "latest.pt" if args.resume == "latest" else Path(args.resume)
         runner = TrainingRunner.resume(checkpoint, device=args.device)
     else:
-        config = load_run_config(args.config) if args.config is not None else TrainingRunConfig()
-        runner = TrainingRunner(config, args.run_dir, device=args.device)
+        if args.init_checkpoint is not None and config is not None and config.init_checkpoint is not None:
+            _parser().error("specify init checkpoint either in config or with --init-checkpoint, not both")
+        runner = TrainingRunner(config or TrainingRunConfig(), args.run_dir, device=args.device, init_checkpoint=args.init_checkpoint)
     result = runner.run(until_iteration=args.iterations, install_signal_handlers=True)
     status = "interrupted safely" if result.interrupted else "completed"
     print(

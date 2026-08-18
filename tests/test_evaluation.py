@@ -27,7 +27,7 @@ def test_suite_uses_identical_fixed_deals_and_exact_position_rotation(tmp_path) 
         assert matchup.league_score == pytest.approx(matchup.win_rate + 0.5 * matchup.tie_rate)
     output = first.write_json(tmp_path / "reports" / "candidate.json")
     encoded = json.loads(output.read_text())
-    assert encoded["schema_version"] == "1.1"
+    assert encoded["schema_version"] == "1.2"
     assert 0.0 <= encoded["aggregate_league_score"] <= 1.0
     assert encoded["matchups"][0]["statistics"]["vpip"] >= 0
     assert encoded["matchups"][0]["bb_per_100_ci95_low"] <= encoded["matchups"][0]["bb_per_100"]
@@ -84,6 +84,31 @@ def test_suite_serializes_and_enforces_stage_raise_abstraction(tmp_path) -> None
     )
     encoded = json.loads(report.write_json(tmp_path / "hu-stage-a.json").read_text())
     assert encoded["config"]["allowed_raise_actions"] == [action.value for action in allowed]
+
+
+def test_paired_position_seeds_repeat_each_deal_and_report_block_ci(monkeypatch) -> None:
+    import poker.evaluation as evaluation
+
+    seen: list[int | None] = []
+    original = evaluation.HandState
+
+    class TrackingHandState(original):
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs.get("seed"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(evaluation, "HandState", TrackingHandState)
+    report = evaluate_suite(
+        "candidate",
+        TightBot(),
+        {"rule": RuleBot()},
+        config=EvaluationConfig(hands_per_opponent=6, player_count=2, seed_start=7_000, equity_samples=1, paired_position_seeds=True),
+    )
+
+    assert seen[:6] == [7_000, 7_000, 7_001, 7_001, 7_002, 7_002]
+    matchup = report.matchups[0]
+    assert matchup.seed_blocks == 3
+    assert matchup.ci_method == "paired_position_seed_block_normal_v1"
 
 
 @pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed; install with .[rl]")

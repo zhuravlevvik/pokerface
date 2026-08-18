@@ -64,6 +64,7 @@ from .curriculum import (
 from .pretraining import EquityBackbonePretrainer, PretrainingConfig, PretrainingMetrics, PretrainingValidation
 from .pretraining_data import PretrainingCorpus, SeedRange, generate_pretraining_corpus, load_pretraining_corpus, write_pretraining_corpus
 from .pretraining_runner import AcceptanceConfig, CorpusConfig, PretrainingRunConfig, PretrainingRunResult, PretrainingRunner
+from .promotion import PromotionConfig, PromotionEvaluation, PromotionEvaluator
 
 __all__ = [
     "Action",
@@ -117,6 +118,9 @@ __all__ = [
     "PretrainingRunResult",
     "PretrainingRunner",
     "PretrainingValidation",
+    "PromotionConfig",
+    "PromotionEvaluation",
+    "PromotionEvaluator",
     "RandomBot",
     "RegressionCase",
     "RegressionControlSet",

@@ -24,6 +24,10 @@
 6. Провести оценочный турнир, сохранить или отклонить checkpoint.
 7. Регулярно добавлять удачные версии в архив лиги.
 
+Реализованный HU promotion loop хранит immutable candidate/report/archive
+артефакты и восстанавливает лигу из hash-проверяемого manifest после resume.
+Подробный операционный контракт: [15_hu_promotion_loop.md](15_hu_promotion_loop.md).
+
 ## Loss
 
 ```text

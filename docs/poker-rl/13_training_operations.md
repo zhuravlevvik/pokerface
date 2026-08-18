@@ -60,6 +60,30 @@ manifest. Запись fsync'ится во временный файл и пуб
 Resume восстанавливает генераторы случайных чисел после создания модели и
 league, поэтому следующий rollout продолжает исходный детерминированный поток.
 
+## Новый PPO-run из warm-start checkpoint
+
+Equity/pretraining checkpoint (или обычный model checkpoint) можно использовать
+только как начальные веса для **нового** PPO-run:
+
+```bash
+.venv/bin/python -m poker.train_cli \
+  --config configs/hu-stage-a.json \
+  --run-dir runs/hu-stage-a-warm \
+  --init-checkpoint runs/pretrain-stage-a/checkpoints/latest.pt
+```
+
+Альтернатива — задать `"init_checkpoint": "..."` на верхнем уровне run
+config. Архитектура и versioned model metadata обязаны точно совпадать с
+`model` в новом config. Инициализация переносит исключительно model weights:
+optimizer, RNG, league, счётчики и manifest создаются заново. `--resume` и
+`--init-checkpoint` взаимоисключающие; для продолжения полного PPO-run нужен
+только `--resume`.
+
+Если включён блок `promotion`, runner после заданного числа завершённых PPO
+iterations сначала публикует frozen candidate, затем выполняет фиксированный
+HU evaluation. Evaluation не меняет RNG обучаемого процесса; принятое решение
+и состав исторической лиги входят в следующий full-run checkpoint.
+
 ## Просмотр checkpoint'а
 
 Full training checkpoint совместим с inference loader. Запустить несколько

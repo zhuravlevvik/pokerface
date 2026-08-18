@@ -28,6 +28,7 @@
 12. [Вехи и критерии готовности](12_milestones.md)
 13. [Запуск, остановка и продолжение обучения](13_training_operations.md)
 14. [Предобучение equity/backbone](14_equity_pretraining.md)
+15. [Heads-up evaluation и promotion loop](15_hu_promotion_loop.md)
 
 Текущее состояние реализации и доказательства проверок: [release-readiness audit](12_release_readiness.md).
 
