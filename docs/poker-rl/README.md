@@ -10,7 +10,7 @@
 - Одна сеть и общие веса для всех позиций; позиция входит во входные признаки.
 - Обучение: curriculum (heads-up → 3-max → 5-max) и league self-play.
 - Основной алгоритм первой версии: PPO/GAE; Deep CFR/NFSP — отдельный исследовательский этап после стабилизации среды.
-- Дополнительная equity-head возвращает `P(win)`, `P(tie)`, `P(loss)` и отображаемое значение `P(win) + 0.5 × P(tie)`.
+- Дополнительная equity-head возвращает `P(win)`, `P(tie)`, `P(loss)`. Скаляр `P(win) + 0.5 × P(tie)` используется как доля банка только в heads-up; для multiway потребуется отдельная expected-share метка.
 
 ## Порядок работы
 
@@ -27,6 +27,7 @@
 11. [Инференс и интерфейс](11_inference_and_ui.md)
 12. [Вехи и критерии готовности](12_milestones.md)
 13. [Запуск, остановка и продолжение обучения](13_training_operations.md)
+14. [Предобучение equity/backbone](14_equity_pretraining.md)
 
 Текущее состояние реализации и доказательства проверок: [release-readiness audit](12_release_readiness.md).
 

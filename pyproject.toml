@@ -9,6 +9,7 @@ description = "Deterministic no-limit Texas Hold'em engine"
 requires-python = ">=3.11"
 
 [project.scripts]
+pokerface-pretrain = "poker.pretrain_cli:main"
 pokerface-train = "poker.train_cli:main"
 pokerface-watch = "poker.watch:main"
 

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-from math import isfinite, log
+from itertools import combinations
+from math import comb, isfinite, log
 from random import Random
 from typing import Iterable, Sequence
 
@@ -169,15 +170,20 @@ def capture_equity_snapshot(state: HandState, hero_seat: int, *, reference: str 
 def generate_equity_target(snapshot: EquitySnapshot, *, samples: int = 16, seed: int | None = None) -> EquityTarget:
     """Build a soft virtual-showdown target for ``snapshot``.
 
-    On the river the outcome is evaluated exactly once.  Before it, ``samples``
-    independently sampled runouts approximate the conditional distribution.
-    The actual continuation of the hand, folds, and final payout are not read.
+    On the river the outcome is evaluated exactly once.  On earlier streets,
+    all runouts are enumerated when ``samples`` covers the combination count;
+    otherwise independently sampled runouts approximate the conditional
+    distribution.  The actual continuation, folds, and final payout are not read.
     """
 
     if samples < 1:
         raise ValueError("samples must be positive")
+    runout_count = comb(len(snapshot.remaining_deck), snapshot.cards_to_come)
     if snapshot.cards_to_come == 0:
         outcomes = [_showdown_outcome(snapshot, ())]
+        exact = True
+    elif samples >= runout_count:
+        outcomes = [_showdown_outcome(snapshot, runout) for runout in combinations(snapshot.remaining_deck, snapshot.cards_to_come)]
         exact = True
     else:
         randomizer = Random(_stable_seed(snapshot) if seed is None else seed)

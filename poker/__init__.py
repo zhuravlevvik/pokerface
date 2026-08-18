@@ -61,6 +61,9 @@ from .curriculum import (
     stage_spec,
     transfer_checkpoint,
 )
+from .pretraining import EquityBackbonePretrainer, PretrainingConfig, PretrainingMetrics, PretrainingValidation
+from .pretraining_data import PretrainingCorpus, SeedRange, generate_pretraining_corpus, load_pretraining_corpus, write_pretraining_corpus
+from .pretraining_runner import AcceptanceConfig, CorpusConfig, PretrainingRunConfig, PretrainingRunResult, PretrainingRunner
 
 __all__ = [
     "Action",
@@ -82,6 +85,7 @@ __all__ = [
     "EvaluationConfig",
     "EvaluationSuiteReport",
     "EquityCalibrationBin",
+    "EquityBackbonePretrainer",
     "EquityMetrics",
     "EquitySnapshot",
     "EquityTarget",
@@ -106,6 +110,13 @@ __all__ = [
     "PokerStyleStatistics",
     "PokerAgentModel",
     "PretrainingExample",
+    "PretrainingConfig",
+    "PretrainingCorpus",
+    "PretrainingMetrics",
+    "PretrainingRunConfig",
+    "PretrainingRunResult",
+    "PretrainingRunner",
+    "PretrainingValidation",
     "RandomBot",
     "RegressionCase",
     "RegressionControlSet",
@@ -118,6 +129,9 @@ __all__ = [
     "StageEvaluation",
     "StageScheduler",
     "StageTransitionError",
+    "AcceptanceConfig",
+    "CorpusConfig",
+    "SeedRange",
     "TORCH_AVAILABLE",
     "TightBot",
     "TournamentResult",
@@ -130,10 +144,13 @@ __all__ = [
     "evaluate_suite",
     "generate_equity_target",
     "generate_pretraining_dataset",
+    "generate_pretraining_corpus",
+    "load_pretraining_corpus",
     "run_tournament",
     "run_sanity_checks",
     "observation_for",
     "save_curriculum_checkpoint",
     "stage_spec",
     "transfer_checkpoint",
+    "write_pretraining_corpus",
 ]

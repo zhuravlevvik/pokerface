@@ -18,6 +18,10 @@ from .observation import observation_for
 from .rules import BIG_BLIND
 
 
+EQUITY_LABEL_PROTOCOL = "fixed_deal_virtual_showdown_v1"
+"""Labels use dealt hidden opponents plus sampled future-board runouts."""
+
+
 def _action_log(state: HandState) -> list[dict[str, Any]]:
     return [record.as_dict() for record in state.action_history]
 
@@ -40,6 +44,9 @@ class DecisionTrace:
     terminal_pnl_bb: float | None = None
     equity_snapshot_reference: str | None = None
     equity_target: list[float] | None = None
+    equity_samples: int | None = None
+    equity_exact: bool | None = None
+    label_protocol: str = EQUITY_LABEL_PROTOCOL
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable copy suitable for a compact dataset."""
@@ -59,6 +66,9 @@ class DecisionTrace:
             "terminal_pnl_bb": self.terminal_pnl_bb,
             "equity_snapshot_reference": self.equity_snapshot_reference,
             "equity_target": None if self.equity_target is None else list(self.equity_target),
+            "equity_samples": self.equity_samples,
+            "equity_exact": self.equity_exact,
+            "label_protocol": self.label_protocol,
         }
 
 
@@ -117,6 +127,8 @@ class HandTrace:
                 raise RuntimeError("decision has no equity snapshot")
             target: EquityTarget = generate_equity_target(self._equity_snapshots[reference], samples=self.equity_samples)
             decision.equity_target = target.as_list()
+            decision.equity_samples = target.samples
+            decision.equity_exact = target.exact
 
     def as_training_records(self) -> list[dict[str, Any]]:
         """Return model-safe records, including labels but never hidden cards."""
