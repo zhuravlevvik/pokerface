@@ -65,6 +65,12 @@ from .pretraining import EquityBackbonePretrainer, PretrainingConfig, Pretrainin
 from .pretraining_data import PretrainingCorpus, SeedRange, generate_pretraining_corpus, load_pretraining_corpus, write_pretraining_corpus
 from .pretraining_runner import AcceptanceConfig, CorpusConfig, PretrainingRunConfig, PretrainingRunResult, PretrainingRunner
 from .promotion import PromotionConfig, PromotionEvaluation, PromotionEvaluator
+from .curriculum_transition import (
+    CurriculumTransitionConfig,
+    CurriculumTransitionEvaluator,
+    TransitionEvaluation,
+    TransitionEvidence,
+)
 
 __all__ = [
     "Action",
@@ -78,6 +84,8 @@ __all__ = [
     "CurriculumConfig",
     "CurriculumStage",
     "CurriculumStageSpec",
+    "CurriculumTransitionConfig",
+    "CurriculumTransitionEvaluator",
     "BotStatistics",
     "BET_SIZE_ACTIONS",
     "CallingStationBot",
@@ -138,6 +146,8 @@ __all__ = [
     "SeedRange",
     "TORCH_AVAILABLE",
     "TightBot",
+    "TransitionEvaluation",
+    "TransitionEvidence",
     "TournamentResult",
     "TracePretrainingDataset",
     "benchmark_hands",

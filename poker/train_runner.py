@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from .bots import AggroBot, CallingStationBot, RandomBot, RuleBot, TightBot
 from .curriculum import CurriculumConfig, CurriculumStage, StageScheduler, stage_spec
+from .curriculum_transition import CurriculumTransitionConfig, CurriculumTransitionEvaluator, TransitionEvaluation
 from .league import BotPolicy, LeagueMember, ModelPolicy, OpponentLeague
 from .model import ModelConfig, TORCH_AVAILABLE, PokerAgentModel
 from .promotion import PromotionConfig, PromotionEvaluation, PromotionEvaluator
@@ -123,6 +124,7 @@ class TrainingRunConfig:
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     league: LeagueConfig = field(default_factory=LeagueConfig)
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
+    transition: CurriculumTransitionConfig = field(default_factory=CurriculumTransitionConfig)
     # This is deliberately model-only initialization, never a continuation of
     # optimizer, RNG, league, or rollout state from another run.
     init_checkpoint: str | None = None
@@ -137,10 +139,23 @@ class TrainingRunConfig:
             raise ValueError("init_checkpoint must be a non-empty path string or null")
         if self.promotion.enabled and stage_spec(self.run.stage).player_count != 2:
             raise ValueError("the current promotion protocol can only be enabled for heads-up stages A/B")
+        if self.transition.enabled:
+            if self.promotion.enabled:
+                raise ValueError("promotion and automatic curriculum transition cannot be enabled in the same run")
+            if self.run.stage is not self.transition.source_stage:
+                raise ValueError("automatic curriculum transition must start at its declared source stage")
+            if self.transition.curriculum != self.curriculum:
+                raise ValueError("transition.curriculum must match the run curriculum configuration")
+            if self.curriculum.require_transfer_beats_scratch:
+                raise ValueError(
+                    "automatic A -> B transition cannot require transfer-vs-scratch until a paired scratch rung is configured"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["run"]["stage"] = self.run.stage.value
+        data["transition"]["source_stage"] = self.transition.source_stage.value
+        data["transition"]["target_stage"] = self.transition.target_stage.value
         return data
 
     @classmethod
@@ -168,13 +183,31 @@ class TrainingRunConfig:
             if not isinstance(baseline_bots, Sequence) or isinstance(baseline_bots, (str, bytes)):
                 raise ValueError("promotion.baseline_bots must be an array")
             promotion_data["baseline_bots"] = tuple(baseline_bots)
+        transition_data = mapping("transition")
+        transition_baselines = transition_data.get("baseline_bots")
+        if transition_baselines is not None:
+            if not isinstance(transition_baselines, Sequence) or isinstance(transition_baselines, (str, bytes)):
+                raise ValueError("transition.baseline_bots must be an array")
+            transition_data["baseline_bots"] = tuple(transition_baselines)
+        for key in ("source_stage", "target_stage"):
+            if key in transition_data:
+                transition_data[key] = CurriculumStage(transition_data[key])
+        transition_curriculum = transition_data.get("curriculum")
+        if transition_curriculum is not None:
+            if not isinstance(transition_curriculum, Mapping):
+                raise ValueError("transition.curriculum must be an object")
+            transition_data["curriculum"] = CurriculumConfig(**dict(transition_curriculum))
+        curriculum = CurriculumConfig(**mapping("curriculum"))
+        if "curriculum" not in transition_data:
+            transition_data["curriculum"] = curriculum
         return cls(
             run=RunSettings(**run_data),
             model=ModelConfig(**mapping("model")),
             ppo=PPOConfig(**mapping("ppo")),
-            curriculum=CurriculumConfig(**mapping("curriculum")),
+            curriculum=curriculum,
             league=LeagueConfig(**league_data),
             promotion=PromotionConfig(**promotion_data),
+            transition=CurriculumTransitionConfig(**transition_data),
             init_checkpoint=data.get("init_checkpoint"),
         )
 
@@ -240,6 +273,30 @@ def _file_sha256(path: Path) -> str:
 def _canonical_sha256(value: Mapping[str, Any]) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return sha256(encoded).hexdigest()
+
+
+def _validate_transition_reference(config: CurriculumTransitionConfig, model: PokerAgentModel) -> None:
+    """Fail before training if the pinned prior is not an immutable Stage A run."""
+
+    _require_torch()
+    reference = Path(config.reference_checkpoint or "")
+    if not reference.is_file():
+        raise FileNotFoundError(reference)
+    if _file_sha256(reference) != config.reference_checkpoint_sha256:
+        raise ValueError("curriculum transition reference checkpoint SHA-256 does not match config")
+    payload = torch.load(reference, map_location="cpu", weights_only=True)
+    curriculum = payload.get("curriculum") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(payload, Mapping)
+        or not isinstance(payload.get("run_config"), Mapping)
+        or not isinstance(payload.get("progress"), Mapping)
+        or not isinstance(curriculum, Mapping)
+        or curriculum.get("stage") != config.source_stage.value
+    ):
+        raise ValueError("curriculum transition reference must be a full Stage A training checkpoint")
+    reference_model = PokerAgentModel.load_checkpoint(reference, map_location="cpu")
+    if reference_model.checkpoint_metadata() != model.checkpoint_metadata():
+        raise ValueError("curriculum transition reference checkpoint is incompatible with the run model")
 
 
 def _fsync_file(path: Path) -> None:
@@ -454,6 +511,12 @@ class TrainingRunner:
             # Loading a source model constructs modules and may consume global
             # RNG.  A fresh PPO run must begin from its own configured stream.
             self._seed_everything(config.run.seed)
+        if config.transition.enabled:
+            rng = _rng_state()
+            try:
+                _validate_transition_reference(config.transition, self.model)
+            finally:
+                _restore_rng_state(rng)
         self.league = build_league(config.league, self.model, fallback_seed=config.run.seed)
         self.trainer = PPOTrainer(self.model, self.league, config.ppo, device=device)
         self._apply_stage_learning_rate()
@@ -471,6 +534,15 @@ class TrainingRunner:
         )
         if self.promotion_evaluator is not None and self.promotion_evaluator.last_evaluated_iteration >= 0:
             raise ValueError("run directory already contains promotion state; use --resume")
+        self.last_transition_evaluation_iteration = -1
+        self.pending_transition_iteration: int | None = None
+        self.transition_evaluator = (
+            CurriculumTransitionEvaluator(config.transition, self.run_directory, run_seed=config.run.seed)
+            if config.transition.enabled
+            else None
+        )
+        if self.transition_evaluator is not None and self.transition_evaluator.last_evaluated_iteration >= 0:
+            raise ValueError("run directory already contains curriculum transition state; use --resume")
         self.manifest: dict[str, Any] = {"version": 1, "checkpoints": []}
         if self.init_checkpoint is not None:
             self.manifest["initialization"] = {
@@ -483,6 +555,12 @@ class TrainingRunner:
             self.manifest["promotion"] = {
                 "enabled": True,
                 "archive_manifest": str(self.promotion_evaluator.archive_manifest_path),
+                "evaluations": [],
+            }
+        if self.transition_evaluator is not None:
+            self.manifest["curriculum_transition"] = {
+                "enabled": True,
+                "manifest": str(self.transition_evaluator.archive_manifest_path),
                 "evaluations": [],
             }
         self._stop_requested = False
@@ -556,6 +634,16 @@ class TrainingRunner:
                 "archive_manifest_sha256": None
                 if self.promotion_evaluator is None or not self.promotion_evaluator.archive_manifest_path.exists()
                 else _file_sha256(self.promotion_evaluator.archive_manifest_path),
+            },
+            "curriculum_transition_state": {
+                "last_evaluation_iteration": self.last_transition_evaluation_iteration,
+                "pending_transition_iteration": self.pending_transition_iteration,
+                "manifest": None
+                if self.transition_evaluator is None
+                else str(self.transition_evaluator.archive_manifest_path),
+                "manifest_sha256": None
+                if self.transition_evaluator is None or not self.transition_evaluator.archive_manifest_path.exists()
+                else _file_sha256(self.transition_evaluator.archive_manifest_path),
             },
             "effective_learning_rate": self.trainer.optimizer.param_groups[0]["lr"],
             "manifest": self.manifest,
@@ -703,6 +791,83 @@ class TrainingRunner:
             if not isinstance(section, dict):
                 raise ValueError("checkpoint manifest has invalid promotion section")
             section["evaluations"] = list(instance.promotion_evaluator.archive_manifest.get("decisions", []))
+        transition_state = payload.get("curriculum_transition_state", {})
+        if not isinstance(transition_state, Mapping):
+            raise ValueError("checkpoint has invalid curriculum transition state")
+        saved_transition_last = transition_state.get("last_evaluation_iteration", -1)
+        if not isinstance(saved_transition_last, int) or saved_transition_last < -1:
+            raise ValueError("checkpoint has invalid last curriculum transition evaluation")
+        pending_transition = transition_state.get("pending_transition_iteration")
+        if pending_transition is not None and (
+            not isinstance(pending_transition, int)
+            or pending_transition < 1
+            or pending_transition != instance.iteration
+        ):
+            raise ValueError("checkpoint has invalid pending curriculum transition iteration")
+        instance.transition_evaluator = (
+            CurriculumTransitionEvaluator(config.transition, instance.run_directory, run_seed=config.run.seed)
+            if config.transition.enabled
+            else None
+        )
+        if instance.transition_evaluator is None:
+            if pending_transition is not None:
+                raise ValueError("checkpoint has pending curriculum transition but automation is disabled")
+            instance.last_transition_evaluation_iteration = saved_transition_last
+            instance.pending_transition_iteration = None
+        else:
+            _validate_transition_reference(config.transition, instance.model)
+            transition_last = instance.transition_evaluator.last_evaluated_iteration
+            if transition_last > instance.iteration:
+                raise ValueError("curriculum transition manifest is ahead of the restored training iteration")
+            saved_transition_sha = transition_state.get("manifest_sha256")
+            if transition_last == saved_transition_last and saved_transition_sha is not None:
+                manifest_path = instance.transition_evaluator.archive_manifest_path
+                if not isinstance(saved_transition_sha, str) or _file_sha256(manifest_path) != saved_transition_sha:
+                    raise ValueError("curriculum transition manifest does not match full-run checkpoint")
+            if transition_last < saved_transition_last:
+                raise ValueError("curriculum transition manifest is behind the restored full-run checkpoint")
+            if transition_last > saved_transition_last and pending_transition != transition_last:
+                raise ValueError("curriculum transition manifest is ahead without a matching durable intent")
+            transition_decisions = instance.transition_evaluator.manifest.get("decisions", [])
+            if not isinstance(transition_decisions, list):
+                raise ValueError("curriculum transition manifest decisions are malformed")
+            run_config_sha = _canonical_sha256(config.to_dict())
+            for decision in transition_decisions:
+                iteration = decision.get("iteration") if isinstance(decision, Mapping) else None
+                if not isinstance(iteration, int):
+                    raise ValueError("curriculum transition manifest has an invalid decision iteration")
+                source = instance.checkpoint_directory / f"transition_candidate_{iteration:08d}.pt"
+                recorded_source = decision.get("source_full_checkpoint")
+                if (
+                    not isinstance(recorded_source, str)
+                    or Path(recorded_source).resolve() != source.resolve()
+                    or not source.exists()
+                    or decision.get("source_full_checkpoint_sha256") != _file_sha256(source)
+                    or decision.get("run_config_sha256") != run_config_sha
+                ):
+                    raise ValueError("curriculum transition decision does not belong to this training run")
+            if sum(bool(item.get("accepted")) for item in transition_decisions if isinstance(item, Mapping)) > 1:
+                raise ValueError("curriculum transition manifest contains multiple accepted A -> B decisions")
+            accepted = instance.transition_evaluator.last_accepted_decision
+            if instance.scheduler.stage is config.transition.target_stage:
+                if accepted is None:
+                    raise ValueError("target curriculum stage has no accepted transition evidence")
+                pending_transition = None
+            elif accepted is not None and pending_transition != int(accepted["iteration"]):
+                raise ValueError("accepted curriculum transition is ahead without a matching durable intent")
+            instance.last_transition_evaluation_iteration = max(saved_transition_last, transition_last)
+            instance.pending_transition_iteration = pending_transition
+            section = instance.manifest.setdefault(
+                "curriculum_transition",
+                {
+                    "enabled": True,
+                    "manifest": str(instance.transition_evaluator.archive_manifest_path),
+                    "evaluations": [],
+                },
+            )
+            if not isinstance(section, dict):
+                raise ValueError("checkpoint manifest curriculum transition section is corrupted")
+            section["evaluations"] = list(instance.transition_evaluator.manifest.get("decisions", []))
         instance._stop_requested = False
         instance._last_checkpoint_time = time.monotonic()
         control = payload.get("checkpoint_control", {})
@@ -771,6 +936,67 @@ class TrainingRunner:
         self.save_checkpoint(reason="promotion", metrics=metrics)
         return result
 
+    def _reset_optimizer_for_stage(self) -> None:
+        """Start a fresh optimiser while preserving the rollout seed stream."""
+
+        seed_counter = self.trainer._seed_counter
+        self.trainer = PPOTrainer(self.model, self.league, self.config.ppo, device=self.device)
+        self.trainer._seed_counter = seed_counter
+        self._apply_stage_learning_rate()
+
+    def _run_curriculum_transition(self, metrics: UpdateMetrics | None = None) -> TransitionEvaluation:
+        if self.transition_evaluator is None:
+            raise RuntimeError("automatic curriculum transition is not enabled for this run")
+        if self.scheduler.stage not in {self.config.transition.source_stage, self.config.transition.target_stage}:
+            raise RuntimeError("automatic transition state is incompatible with the active curriculum stage")
+        self.pending_transition_iteration = self.iteration
+        source = self.checkpoint_directory / f"transition_candidate_{self.iteration:08d}.pt"
+        if not source.exists():
+            source = self.save_checkpoint(reason="transition_candidate", metrics=metrics)
+        rng = _rng_state()
+        try:
+            result = self.transition_evaluator.evaluate_transition(
+                iteration=self.iteration,
+                candidate_checkpoint=source,
+                reference_checkpoint=self.config.transition.reference_checkpoint,
+                stage=self.scheduler.stage,
+                league=self.league,
+                run_context={
+                    "iteration": self.iteration,
+                    "global_decisions": self.global_decisions,
+                    "global_hands": self.global_hands,
+                    "run_config_sha256": _canonical_sha256(self.config.to_dict()),
+                },
+            )
+        finally:
+            # Evaluation/model loading must not change the learner's next
+            # rollout stream, whether the transition is accepted or rejected.
+            _restore_rng_state(rng)
+        self.last_transition_evaluation_iteration = self.iteration
+        if result.accepted and self.scheduler.stage is self.config.transition.source_stage:
+            self.scheduler.advance(result.evidence.stage_evaluation)
+            if self.config.transition.reset_optimizer:
+                self._reset_optimizer_for_stage()
+            else:
+                self._apply_stage_learning_rate()
+        self.pending_transition_iteration = None
+        section = self.manifest.setdefault(
+            "curriculum_transition",
+            {"enabled": True, "manifest": str(self.transition_evaluator.archive_manifest_path), "evaluations": []},
+        )
+        if not isinstance(section, dict) or not isinstance(section.setdefault("evaluations", []), list):
+            raise ValueError("run manifest curriculum transition section is corrupted")
+        decisions = self.transition_evaluator.manifest.get("decisions", [])
+        if not isinstance(decisions, list) or not decisions:
+            raise ValueError("curriculum transition completed without an immutable decision")
+        record = dict(decisions[-1])
+        evaluations = section["evaluations"]
+        if not evaluations or evaluations[-1] != record:
+            evaluations.append(record)
+        reason = "curriculum_transition" if result.accepted else "curriculum_transition_rejected"
+        self.save_checkpoint(reason=reason, metrics=metrics)
+        return result
+
     def _validate_recovered_promotion(self, iteration: int) -> None:
         if self.promotion_evaluator is None:
             raise RuntimeError("promotion recovery requires an evaluator")
@@ -836,6 +1062,26 @@ class TrainingRunner:
                 if self._stop_requested:
                     path = self.save_checkpoint(reason="interrupt")
                     return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
+            if self.pending_transition_iteration is not None:
+                self._run_curriculum_transition()
+                if self._stop_requested:
+                    path = self.save_checkpoint(reason="interrupt")
+                    return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
+            elif (
+                self.transition_evaluator is not None
+                and self.scheduler.stage is self.config.transition.source_stage
+                and self.transition_evaluator.should_evaluate(
+                    self.iteration,
+                    last_evaluation_iteration=self.last_transition_evaluation_iteration,
+                )
+            ):
+                # An interrupt checkpoint may have been written after a PPO
+                # boundary but before the scheduled transition evaluation.
+                # Finish that boundary before consuming another rollout.
+                self._run_curriculum_transition()
+                if self._stop_requested:
+                    path = self.save_checkpoint(reason="interrupt")
+                    return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
             while self.iteration < target:
                 metrics = self._train_one_iteration()
                 if self._stop_requested:
@@ -849,6 +1095,18 @@ class TrainingRunner:
                     if self._stop_requested:
                         path = self.save_checkpoint(reason="interrupt", metrics=metrics)
                         return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
+                if (
+                    self.transition_evaluator is not None
+                    and self.scheduler.stage is self.config.transition.source_stage
+                    and self.transition_evaluator.should_evaluate(
+                        self.iteration,
+                        last_evaluation_iteration=self.last_transition_evaluation_iteration,
+                    )
+                ):
+                    self._run_curriculum_transition(metrics)
+                    if self._stop_requested:
+                        path = self.save_checkpoint(reason="interrupt", metrics=metrics)
+                        return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
                 if self._should_checkpoint():
                     self.save_checkpoint(metrics=metrics)
             if self.promotion_evaluator is not None and self.promotion_evaluator.should_evaluate(
@@ -857,6 +1115,19 @@ class TrainingRunner:
                 last_evaluation_iteration=self.last_evaluation_iteration,
             ):
                 self._run_promotion()
+                if self._stop_requested:
+                    path = self.save_checkpoint(reason="interrupt")
+                    return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
+            if (
+                self.transition_evaluator is not None
+                and self.scheduler.stage is self.config.transition.source_stage
+                and self.transition_evaluator.should_evaluate(
+                    self.iteration,
+                    completing=True,
+                    last_evaluation_iteration=self.last_transition_evaluation_iteration,
+                )
+            ):
+                self._run_curriculum_transition()
                 if self._stop_requested:
                     path = self.save_checkpoint(reason="interrupt")
                     return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)

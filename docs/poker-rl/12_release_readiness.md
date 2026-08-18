@@ -21,7 +21,7 @@ evaluation-отчёта такого checkpoint'а или результатов
 
 ```bash
 .venv/bin/python -m pytest
-# 122 passed, 2 warnings
+# 132 passed, 2 warnings
 
 .venv/bin/python -m compileall -q poker
 # успех
@@ -53,8 +53,8 @@ evaluation-отчёта такого checkpoint'а или результатов
 | M2 — наблюдаемый покер без RL | **Частично** | Baseline-боты и турниры: `poker/bots.py`, `poker/tournament.py`; веб-стол и replay: `poker/game_server.py`, `poker/web.py`, `poker/static/`; тесты `test_baseline_bots.py`, `test_game_server.py`. | Нет режима, в котором человек сам выбирает ход за hero seat: текущий `GameServer` запрашивает `DecisionService` для каждого места. Нет browser E2E-теста реального рендеринга. |
 | M3 — состояние и equity | **Инфраструктура готова; приёмка не доказана** | Versioned observation: `poker/observation.py`; модель с policy, bet-size, value и equity: `poker/model.py`; virtual-showdown labels и calibration metrics: `poker/equity.py`, `poker/traces.py`; restricted reproducibility corpus, resumable pretrainer и holdout report: `poker/pretraining_data.py`, `poker/pretraining.py`, `poker/pretraining_runner.py`; тесты `test_observation_environment.py`, `test_model.py`, `test_equity_labels.py`, `test_pretraining*.py`. | Нет сохранённого отчёта калибровки реально предобученной модели. Поэтому нельзя утверждать, что equity калибрована, лишь что подсчёт label, обучение и формат отчёта реализованы. |
 | M4 — heads-up self-play | **Не пройдена; инфраструктура gate готова** | PPO/GAE и batched policy sampling имеются в `poker/training.py`; heads-up stage описан в `poker/curriculum.py`; `poker.train_cli` запускает воспроизводимый resumable run с graceful `Ctrl+C` и warm-start из pretraining checkpoint; `poker/promotion.py` выполняет paired-seed HU evaluation, immutable candidate/archive и CI/calibration/regression gates. | Нет реально обученного и promoted heads-up checkpoint'а с сохранённым evaluation report. Нельзя заявлять превосходство над baseline. |
-| M5 — 3-max и 5-max | **Не пройдена** | Curriculum A--E и transfer metadata: `poker/curriculum.py`; league и immutable checkpoint archive: `poker/league.py`; тесты `test_curriculum.py`, `test_league_training.py`. | Нет результатов transfer, archive реальных стратегий, позиционно-ротированного турнира или оценки устойчивости 3-/5-max модели. |
-| M6 — эксплуатационная готовность | **Частично** | Versioned model/full-run checkpoints: `poker/model.py`, `poker/train_runner.py`; atomic save, optimizer/RNG/league resume, run manifest и CLI; machine-readable stage-aware report с paired-block CI: `poker/evaluation.py`; hash-проверяемый HU promotion archive и crash recovery: `poker/promotion.py`; fixed regression control set: `poker/curriculum.py`; inference boundary: `poker/inference.py`. | Promotion orchestration пока только HU; нет опубликованных evaluation reports реального checkpoint'а, автоматического curriculum transfer gate A→B→C и versioned HTTP API (`/api/v1/...`). |
+| M5 — 3-max и 5-max | **Не пройдена** | Curriculum A--E и transfer metadata: `poker/curriculum.py`; league и immutable checkpoint archive: `poker/league.py`; тесты `test_curriculum.py`, `test_league_training.py`. | Нет результатов transfer, archive реальных стратегий, позиционно-ротированного турнира или оценки устойчивости 3-/5-max модели. Автоматический C--E намеренно блокирован: нужен multiway expected-share head и реальный paired scratch rung. |
+| M6 — эксплуатационная готовность | **Частично** | Versioned model/full-run checkpoints: `poker/model.py`, `poker/train_runner.py`; atomic save, optimizer/RNG/league resume, run manifest и CLI; machine-readable stage-aware report с paired-block CI: `poker/evaluation.py`; hash-проверяемые HU promotion и A→B transition evidence/recovery: `poker/promotion.py`, `poker/curriculum_transition.py`; fixed regression control set: `poker/curriculum.py`; inference boundary: `poker/inference.py`. | Promotion и transition взаимно исключены и пока только HU. Нет опубликованного evaluation report реального checkpoint'а, genuine scratch-rung для transfer claim, автоматизации C--E и versioned HTTP API (`/api/v1/...`). |
 | M7 — демонстрационный продукт | **Частично** | HTTP/WebSocket UI, action history, equity graph, player/spectator modes и replay реализованы в `poker/web.py`, `poker/game_server.py`, `poker/static/`; mixed-policy UI и `poker.watch` запускают 2/3/5-max checkpoint-vs-bot/checkpoint серии. Тесты проверяют safe checkpoint catalog и отсутствие утечки opponent analysis в player-mode. | Нет browser E2E-подтверждения и демонстрационного replay от реально обученного checkpoint'а, привязанного к release. |
 
 ## Связь с коммитами
@@ -109,9 +109,10 @@ checkpoint'ом и содержать commit SHA, config, seed range и хеш c
    и его equity-метрики соответствуют порогу `CurriculumConfig`.
 4. Для каждого следующего curriculum stage сохранить parent checkpoint,
    `StageEvaluation`, результаты regression control set и сравнение transfer
-   против scratch при одинаковом бюджете.
-5. До заявки M6 расширить promotion/evaluation gate на curriculum transfer,
-   добавить автоматический previous-stage control gate и versioned HTTP API.
+   против scratch при одинаковом бюджете. Для A→B immutable evidence есть, но
+   `require_transfer_beats_scratch=false` не заменяет этот эксперимент.
+5. До заявки M6 расширить evidence на C--E после появления multiway
+   expected-share head и genuine scratch rung; добавить versioned HTTP API.
 6. До заявки M7 добавить ручной режим hero (если он остаётся частью
    требований), browser E2E и прикреплённый demonstration replay от
    зафиксированного checkpoint'а.

@@ -84,6 +84,26 @@ iterations сначала публикует frozen candidate, затем вып
 HU evaluation. Evaluation не меняет RNG обучаемого процесса; принятое решение
 и состав исторической лиги входят в следующий full-run checkpoint.
 
+## Opt-in переход Stage A → B
+
+Вместо promotion Stage A run может включить блок `transition`; два механизма
+взаимоисключающие. Автоматизация требует Stage A full-run
+`transition.reference_checkpoint` и закреплённый
+`transition.reference_checkpoint_sha256`, запускается только из A в B и требует
+`curriculum.require_transfer_beats_scratch=false`, поскольку paired scratch
+rung пока не встроен. Пример полного конфига и трактовка этого ограничения —
+в [16_curriculum_transition.md](16_curriculum_transition.md).
+
+На принятом переходе runner замораживает source, публикует evidence/report и
+transfer artifact, переводит stage на B, сбрасывает optimizer по умолчанию и
+ставит LR `base_learning_rate × 0.7`. Указание `reset_optimizer=false`
+сохраняет optimizer moments, но не отменяет Stage B LR scale.
+
+Если `Ctrl+C` пришёл на transition boundary, сохранённый pending state
+дорабатывается при `--resume` до следующего rollout. Не удаляйте вручную
+`curriculum-transitions/`: resume проверяет hash manifest, candidate, report
+и transfer artifact и остановится при несогласованном состоянии.
+
 ## Просмотр checkpoint'а
 
 Full training checkpoint совместим с inference loader. Запустить несколько
