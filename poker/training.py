@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .betting import Action
 from .league import ModelPolicy, OpponentLeague
@@ -22,6 +22,14 @@ if TORCH_AVAILABLE:
     import torch
     from torch import Tensor
     from torch.nn import functional as F
+else:  # Keep configuration/CLI imports usable on engine-only installations.
+    class _TorchUnavailableDecorator:
+        @staticmethod
+        def no_grad():
+            return lambda function: function
+
+    torch = _TorchUnavailableDecorator()  # type: ignore[assignment]
+    Tensor = Any  # type: ignore[misc,assignment]
 
 
 def _require_torch() -> None:
@@ -181,23 +189,43 @@ class PPOTrainer:
 
     @torch.no_grad()
     def _select_current(self, observation: Mapping[str, object]) -> tuple[Action, int, int, float, float]:
+        """Sample one current-policy action (kept for small callers/tests)."""
+
+        return self._select_current_batch((observation,))[0]
+
+    @torch.no_grad()
+    def _select_current_batch(self, observations: Sequence[Mapping[str, object]]) -> list[tuple[Action, int, int, float, float]]:
+        """Sample current-policy actions for every currently acting table.
+
+        Rollouts commonly contain several tables whose forced current-policy
+        seat acts at once.  One model call here is materially faster than one
+        forward pass per table, while each action remains sampled from its own
+        legal-masked factorised distribution.
+        """
+
+        if not observations:
+            return []
         was_training = self.model.training
         self.model.eval()
-        output = self.model([observation])
-        action_index = int(torch.multinomial(output.action_probabilities[0], 1).item())
-        bet_size_index = -1
-        log_probability = torch.log(output.action_probabilities[0, action_index])
-        if action_index == 3:
-            if not bool(output.bet_size_mask[0].any()):
+        output = self.model(observations)
+        action_indices = torch.multinomial(output.action_probabilities, 1).squeeze(1)
+        log_probabilities = torch.log(output.action_probabilities.gather(1, action_indices.unsqueeze(1)).squeeze(1))
+        bet_size_indices = torch.full_like(action_indices, -1)
+        raised = action_indices == 3
+        if bool(raised.any()):
+            if not bool(output.bet_size_mask[raised].any(dim=1).all()):
                 raise RuntimeError("model sampled raise without a legal raise size")
-            bet_size_index = int(torch.multinomial(output.bet_size_probabilities[0], 1).item())
-            log_probability = log_probability + torch.log(output.bet_size_probabilities[0, bet_size_index])
-            action = Action(BET_SIZE_ACTIONS[bet_size_index])
-        else:
-            action = Action(ACTION_NAMES[action_index])
+            selected_sizes = torch.multinomial(output.bet_size_probabilities[raised], 1).squeeze(1)
+            bet_size_indices[raised] = selected_sizes
+            log_probabilities[raised] += torch.log(output.bet_size_probabilities[raised].gather(1, selected_sizes.unsqueeze(1)).squeeze(1))
         if was_training:
             self.model.train()
-        return action, action_index, bet_size_index, float(log_probability.item()), float(output.value[0].item())
+        result: list[tuple[Action, int, int, float, float]] = []
+        for index, action_index in enumerate(action_indices.tolist()):
+            bet_size_index = int(bet_size_indices[index].item())
+            action = Action(BET_SIZE_ACTIONS[bet_size_index]) if action_index == 3 else Action(ACTION_NAMES[action_index])
+            result.append((action, int(action_index), bet_size_index, float(log_probabilities[index].item()), float(output.value[index].item())))
+        return result
 
     def collect_rollout(
         self,
@@ -207,6 +235,7 @@ class PPOTrainer:
         player_count: int = 5,
         starting_stack: int = 10_000,
         allowed_raise_actions: frozenset[Action] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Rollout:
         """Play exactly ``hand_count`` hands and return current-policy samples.
 
@@ -235,10 +264,10 @@ class PPOTrainer:
             per_table: list[list[RolloutStep]] = [[] for _ in range(batch_size)]
             active = [True] * batch_size
             while any(active):
-                actions: list[Action | None] = []
+                actions: list[Action | None] = [None] * batch_size
+                current_actors: list[tuple[int, Mapping[str, object], int]] = []
                 for table, observation in enumerate(observations):
                     if not active[table]:
-                        actions.append(None)
                         continue
                     if observation is None:
                         raise RuntimeError("live table has no actor observation")
@@ -250,24 +279,38 @@ class PPOTrainer:
                     if not isinstance(legal, Mapping):
                         raise ValueError("observation has malformed legal action mask")
                     if policy.name == self.league.current_name:
-                        action, action_index, size_index, old_logprob, old_value = self._select_current(observation)
-                        per_table[table].append(
-                            RolloutStep(
-                                hand_id=environment.traces[table].hand_id,
-                                seat=seat,
-                                order=len(environment.traces[table].decisions),
-                                observation=dict(observation),
-                                action_index=action_index,
-                                bet_size_index=size_index,
-                                old_log_probability=old_logprob,
-                                old_value=old_value,
-                            )
-                        )
+                        current_actors.append((table, observation, seat))
                     else:
                         action = policy.select_action(observation, legal)  # type: ignore[arg-type]
+                        actions[table] = action
+                sampled = self._select_current_batch([observation for _, observation, _ in current_actors])
+                for (table, observation, seat), (action, action_index, size_index, old_logprob, old_value) in zip(current_actors, sampled, strict=True):
+                    actions[table] = action
+                    per_table[table].append(
+                        RolloutStep(
+                            hand_id=environment.traces[table].hand_id,
+                            seat=seat,
+                            order=len(environment.traces[table].decisions),
+                            observation=dict(observation),
+                            action_index=action_index,
+                            bet_size_index=size_index,
+                            old_log_probability=old_logprob,
+                            old_value=old_value,
+                        )
+                    )
+                for table, action in enumerate(actions):
+                    if not active[table]:
+                        continue
+                    if action is None:  # pragma: no cover - current/bot dispatch invariant.
+                        raise RuntimeError("live table has no selected action")
+                    observation = observations[table]
+                    if observation is None:  # pragma: no cover - active table invariant.
+                        raise RuntimeError("live table has no actor observation")
+                    legal = observation["legal_actions"]
+                    if not isinstance(legal, Mapping):
+                        raise ValueError("observation has malformed legal action mask")
                     if not bool(legal.get(action.value, False)):
-                        raise ValueError(f"league member {policy.name!r} selected illegal action {action.value!r}")
-                    actions.append(action)
+                        raise ValueError(f"selected illegal action {action.value!r}")
                 result = environment.step(actions)
                 observations = result.observations
                 for table, done in enumerate(result.terminal):
@@ -287,6 +330,12 @@ class PPOTrainer:
                     self._finish_hand(per_table[table], result.rewards[table])
                     all_steps.extend(per_table[table])
             completed_hands += batch_size
+            # A process-level runner can request graceful shutdown while a
+            # large rollout is being collected.  Stop only after every table
+            # in the current simulator batch has reached a terminal hand, so
+            # the partial rollout remains valid on-policy data for one update.
+            if should_stop is not None and should_stop():
+                break
         return Rollout(tuple(all_steps), completed_hands)
 
     def _finish_hand(self, steps: list[RolloutStep], rewards: Mapping[int, float]) -> None:
@@ -356,6 +405,20 @@ class PPOTrainer:
 
     def train_iteration(self, hand_count: int, **rollout_kwargs: Any) -> tuple[Rollout, UpdateMetrics]:
         rollout = self.collect_rollout(hand_count, **rollout_kwargs)
+        # A forced current-policy seat can legitimately receive no decision in
+        # a hand (for example, the HU button folds before the current BB acts).
+        # Small smoke runs must not fail nondeterministically in that case.
+        # Continue complete position rotations until at least one on-policy
+        # sample exists; the returned hand count remains the honest consumed
+        # environment budget.
+        player_count = int(rollout_kwargs.get("player_count", 5))
+        empty_batches = 0
+        while not rollout.steps:
+            empty_batches += 1
+            if empty_batches >= player_count:
+                raise RuntimeError("current policy received no decisions during a complete seat rotation")
+            extra = self.collect_rollout(hand_count, **rollout_kwargs)
+            rollout = Rollout(rollout.steps + extra.steps, rollout.hands + extra.hands)
         return rollout, self.update(rollout)
 
 

@@ -7,7 +7,7 @@ from copy import deepcopy
 import pytest
 
 from poker.game_state import HandState
-from poker.model import ACTION_NAMES, BET_SIZE_ACTIONS, TORCH_AVAILABLE, ModelConfig, PokerAgentModel
+from poker.model import ACTION_NAMES, BET_SIZE_ACTIONS, MODEL_VERSION, TORCH_AVAILABLE, ModelConfig, PokerAgentModel
 from poker.observation import observation_for
 
 pytestmark = pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed; install with .[rl]")
@@ -27,6 +27,36 @@ def _short_handed(observation: dict, count: int) -> dict:
     result["player_set"] = result["player_set"][:count]
     result["player_mask"] = [True] * count
     return result
+
+
+def _history_record(*, position: str, action: str, amount_bb: float, current_bet_after_bb: float) -> dict:
+    return {
+        "street": "preflop",
+        "street_index": 0,
+        "position": position,
+        "action": action,
+        "amount_bb": amount_bb,
+        "amount_to_pot": amount_bb / 1.5,
+        "raise_to_bb": None,
+        "raise_to_to_pot": None,
+        "current_bet_after_bb": current_bet_after_bb,
+    }
+
+
+def _card_representation(model: PokerAgentModel, observation: dict) -> torch.Tensor:
+    tensors = model.tensorize([observation])
+    return model.card_encoder(tensors["card_ranks"], tensors["card_suits"], tensors["card_roles"], tensors["card_mask"])
+
+
+def _history_representation(model: PokerAgentModel, observation: dict) -> torch.Tensor:
+    tensors = model.tensorize([observation])
+    return model.history_encoder(
+        tensors["history_streets"],
+        tensors["history_positions"],
+        tensors["history_actions"],
+        tensors["history_numeric"],
+        tensors["history_mask"],
+    )
 
 
 def test_model_handles_two_three_and_five_player_sets_with_one_weight_set() -> None:
@@ -71,3 +101,52 @@ def test_inference_is_deterministic_and_checkpoint_is_versioned(tmp_path) -> Non
     restored = PokerAgentModel.load_checkpoint(checkpoint)
     assert restored.checkpoint_metadata() == model.checkpoint_metadata()
     assert restored.infer(observation) == first
+
+
+def test_card_encoder_distinguishes_which_concrete_card_is_private_or_on_board() -> None:
+    """Regression: v1 pooled rank/suit/role sums and lost this association."""
+
+    torch.manual_seed(10)
+    model = PokerAgentModel(ModelConfig(embedding_dim=16, hidden_dim=32, history_layers=1, attention_heads=4)).eval()
+    private_ace = _decision_observation()
+    private_ace["cards"] = {
+        "hole_cards": ["Ah", "Kd"],
+        "board": ["Qs", "Jc", "2d"],
+        "street": "flop",
+        "street_index": 1,
+    }
+    board_ace = deepcopy(private_ace)
+    board_ace["cards"] = {
+        "hole_cards": ["Qs", "Kd"],
+        "board": ["Ah", "Jc", "2d"],
+        "street": "flop",
+        "street_index": 1,
+    }
+
+    assert not torch.allclose(_card_representation(model, private_ace), _card_representation(model, board_ace))
+
+
+def test_history_encoder_distinguishes_action_order() -> None:
+    """Regression: an order-free Transformer treated these sequences alike."""
+
+    torch.manual_seed(11)
+    model = PokerAgentModel(ModelConfig(embedding_dim=16, hidden_dim=32, history_layers=1, attention_heads=4)).eval()
+    first = _decision_observation()
+    first["action_history"] = [
+        _history_record(position="UTG", action="raise_min", amount_bb=2.0, current_bet_after_bb=2.0),
+        _history_record(position="CO", action="call", amount_bb=2.0, current_bet_after_bb=2.0),
+    ]
+    second = deepcopy(first)
+    second["action_history"] = list(reversed(first["action_history"]))
+
+    assert not torch.allclose(_history_representation(model, first), _history_representation(model, second))
+
+
+def test_model_version_rejects_pre_role_and_order_encoding_checkpoints() -> None:
+    model = PokerAgentModel(ModelConfig(embedding_dim=16, hidden_dim=32, history_layers=1, attention_heads=4))
+    metadata = model.checkpoint_metadata()
+    metadata["model_version"] = "1.0"
+
+    assert MODEL_VERSION == "2.0"
+    with pytest.raises(ValueError, match="incompatible checkpoint model_version"):
+        model._validate_metadata(metadata)

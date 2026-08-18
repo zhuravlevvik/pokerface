@@ -10,7 +10,7 @@ from typing import Any
 from .game_server import GameServer
 
 
-def create_app(game_server: GameServer | None = None):
+def create_app(game_server: GameServer | None = None, *, ui_defaults: dict[str, object] | None = None):
     """Build the HTTP/WebSocket app without starting an external server."""
 
     try:
@@ -20,6 +20,7 @@ def create_app(game_server: GameServer | None = None):
         raise RuntimeError("Web UI requires `pip install -e '.[web]'`.") from error
 
     server = game_server or GameServer()
+    configured_defaults = dict(ui_defaults or {})
     app = FastAPI(title="Pokerface observer", version="0.1.0")
     static_dir = Path(__file__).with_name("static")
 
@@ -30,10 +31,35 @@ def create_app(game_server: GameServer | None = None):
         if not isinstance(mode, str) or not isinstance(hero_seat, int):
             raise ValueError("mode must be a string and hero_seat an integer")
         if message_type == "start_hand":
-            seed = command.get("seed")
+            seed = command.get("seed_start", command.get("seed"))
             if seed is not None and not isinstance(seed, int):
                 raise ValueError("seed must be an integer or null")
-            return server.observe_hand(seed=seed, hero_seat=hero_seat, mode=mode)  # type: ignore[arg-type]
+            player_count = command.get("player_count", 5)
+            hands = command.get("hands", 1)
+            button_seat = command.get("button_seat", 0)
+            if not all(isinstance(value, int) for value in (player_count, hands, button_seat)):
+                raise ValueError("player_count, hands and button_seat must be integers")
+            raw_policies = command.get("seat_policies", {})
+            if not isinstance(raw_policies, dict):
+                raise ValueError("seat_policies must be an object mapping seat to a known policy id")
+            seat_policies: dict[int, str] = {}
+            for raw_seat, policy_id in raw_policies.items():
+                try:
+                    seat = int(raw_seat)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("seat policy keys must be integer seats") from error
+                if not isinstance(policy_id, str):
+                    raise ValueError("seat policy ids must be strings")
+                seat_policies[seat] = policy_id
+            return server.observe_series(
+                seed_start=seed,
+                hands=hands,
+                button_seat=button_seat,
+                player_count=player_count,
+                hero_seat=hero_seat,
+                mode=mode,  # type: ignore[arg-type]
+                seat_policies=seat_policies,
+            )
         if message_type == "replay":
             replay = command.get("replay")
             if not isinstance(replay, dict):
@@ -56,6 +82,16 @@ def create_app(game_server: GameServer | None = None):
     @app.get("/api/health")
     def health():
         return {"status": "ok", "transport": "websocket", "inference": type(server.inference).__name__}
+
+    @app.get("/api/policies")
+    def policies():
+        """Expose only server-registered policy ids, never checkpoint paths."""
+
+        return {
+            "policies": server.available_policies(),
+            "seat_policies": {str(seat): policy for seat, policy in server.default_seat_policies.items()},
+            "defaults": configured_defaults,
+        }
 
     @app.post("/api/hand")
     async def hand(payload: dict[str, Any]):

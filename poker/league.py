@@ -130,8 +130,8 @@ class OpponentLeague:
         """Return policies indexed by seat, rotating the forced current seat.
 
         For each complete ``player_count`` consecutive hands the forced current
-        policy visits every seat exactly once.  Other sampled members are then
-        cyclically shifted as well, so positions are not tied to draw order.
+        policy visits every seat exactly once.  Other members are independently
+        sampled directly into their final seats.
         """
 
         if player_count < 2:
@@ -140,11 +140,8 @@ class OpponentLeague:
         sampled = [self._weighted_sample(exclude_name=self.current_name).policy for _ in range(player_count)]
         forced_seat = self._hand_index % player_count
         sampled[forced_seat] = current
-        shift = self._hand_index % player_count
-        seating = tuple(sampled[(seat - shift) % player_count] for seat in range(player_count))
-        # The cyclic shift moves the forced policy too; assert the basic
-        # contract instead of exposing its implementation detail to callers.
-        if not any(policy.name == self.current_name for policy in seating):
+        seating = tuple(sampled)
+        if seating[forced_seat].name != self.current_name:
             raise RuntimeError("sampled table lost the current policy")
         self._hand_index += 1
         return seating

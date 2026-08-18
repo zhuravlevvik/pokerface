@@ -3,19 +3,27 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Pokerface — наблюдаемый стол</title>
+    <title>Pokerface — просмотр политик</title>
     <link rel="stylesheet" href="/static.css">
   </head>
   <body>
     <header>
-      <h1>Pokerface <small>наблюдаемый 5-max стол</small></h1>
+      <h1>Pokerface <small>просмотр checkpoint vs bot</small></h1>
       <div class="controls">
         <label>Режим <select id="mode"><option value="player">игрок</option><option value="spectator">наблюдатель</option></select></label>
-        <label>Место героя <select id="hero"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+        <label>Игроков <select id="player-count"><option value="2">2 (HU)</option><option value="3">3-max</option><option value="5" selected>5-max</option></select></label>
+        <label>Герой <select id="hero"></select></label>
+        <label>Раздач <input id="hands" type="number" min="1" max="1000" value="1"></label>
         <label>Seed <input id="seed" type="number" placeholder="случайный"></label>
-        <button id="start">Новая раздача</button>
+        <button id="start">Запустить</button>
+        <button id="pause" disabled>Пауза</button>
+        <button id="step" disabled>Следующий ход</button>
+        <button id="next-hand" disabled>Следующая раздача</button>
+        <label>Скорость <select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+        <button id="download" disabled>Скачать replay</button>
         <label class="file">Импорт replay <input id="replay-file" type="file" accept="application/json"></label>
       </div>
+      <div id="seat-controls" class="seat-controls" aria-label="Политика на каждом месте"></div>
       <p id="status" aria-live="polite">Соединение…</p>
     </header>
     <main>
@@ -40,6 +48,7 @@
           <div id="equity-labels" class="muted"></div>
         </section>
         <section><h2>История действий</h2><ol id="history"></ol></section>
+        <section><h2>Серия</h2><div id="series-summary" class="muted">Нет запущенной серии</div></section>
       </aside>
     </main>
     <template id="seat-template"><article class="seat"><b class="position"></b><span class="chips"></span><div class="cards"></div><small class="state"></small></article></template>
