@@ -26,6 +26,7 @@
 10. [Оценка качества](10_evaluation.md)
 11. [Инференс и интерфейс](11_inference_and_ui.md)
 12. [Вехи и критерии готовности](12_milestones.md)
+13. [Запуск, остановка и продолжение обучения](13_training_operations.md)
 
 Текущее состояние реализации и доказательства проверок: [release-readiness audit](12_release_readiness.md).
 

@@ -27,9 +27,17 @@ def test_league_forces_current_policy_and_rotates_its_seat() -> None:
     for _ in range(10):
         seating = league.sample_seating(5)
         current_seats.append(next(index for index, member in enumerate(seating) if member.name == "current"))
-    # A complete rotation covers each position (the schedule need not be
-    # numerically ordered because the whole seating is cyclically shifted).
-    assert set(current_seats[:5]) == set(range(5))
+    assert current_seats[:5] == list(range(5))
+
+
+def test_league_alternates_current_policy_seat_in_heads_up() -> None:
+    model = _model()
+    league = default_league(model, seed=4)
+    current_seats = [
+        next(index for index, member in enumerate(league.sample_seating(2)) if member.name == "current")
+        for _ in range(6)
+    ]
+    assert current_seats == [0, 1, 0, 1, 0, 1]
 
 
 def test_gae_handles_sparse_terminal_pnl_per_player_trajectory() -> None:
@@ -90,3 +98,23 @@ def test_checkpoint_archive_rejects_regression_and_adds_frozen_snapshot(tmp_path
     snapshot = next(member for member in league.members if member.kind == "best")
     assert isinstance(snapshot.policy, ModelPolicy)
     assert all(not parameter.requires_grad for parameter in snapshot.policy.model.parameters())
+
+
+def test_train_iteration_extends_an_empty_rollout_to_a_current_policy_decision(monkeypatch) -> None:
+    model = _model()
+    trainer = PPOTrainer(model, default_league(model, seed=5), PPOConfig(epochs=1, equity_samples=1))
+    from poker.training import Rollout
+
+    real_collect = trainer.collect_rollout
+    calls = 0
+
+    def empty_once(hand_count, **kwargs):
+        nonlocal calls
+        calls += 1
+        return Rollout((), hand_count) if calls == 1 else real_collect(hand_count, **kwargs)
+
+    monkeypatch.setattr(trainer, "collect_rollout", empty_once)
+    rollout, metrics = trainer.train_iteration(1, table_count=1, player_count=2)
+    assert rollout.hands == 2
+    assert rollout.decisions > 0
+    assert metrics.samples == rollout.decisions

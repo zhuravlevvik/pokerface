@@ -28,7 +28,11 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on non-RL installs.
 TORCH_AVAILABLE = torch is not None
 """Whether the optional PyTorch dependency is available in this environment."""
 
-MODEL_VERSION = "1.0"
+# Version 2 changes the card pooling shape and adds order information to the
+# history encoder.  A v1 state dict cannot be loaded safely: aside from the
+# new parameters, its weights were trained on representations that conflate
+# private and board-card assignments and action order.
+MODEL_VERSION = "2.0"
 ACTION_NAMES = ("fold", "check", "call", "raise")
 BET_SIZE_ACTIONS = (
     Action.RAISE_MIN.value,
@@ -109,7 +113,14 @@ class InferenceDecision:
 if TORCH_AVAILABLE:
 
     class CardEncoder(nn.Module):
-        """Embeds known cards by rank, suit and private/public role."""
+        """Encode private and board cards without losing their role binding.
+
+        Encoding all cards into one bag makes ``Ah`` in a hole-card slot
+        indistinguishable from ``Ah`` on the board once the same role counts
+        are present.  We first form a representation for each *card + role*
+        tuple, then pool private and board cards separately.  Card order
+        within either group remains irrelevant, as it should be in Hold'em.
+        """
 
         def __init__(self, config: ModelConfig) -> None:
             super().__init__()
@@ -117,13 +128,32 @@ if TORCH_AVAILABLE:
             self.rank_embedding = nn.Embedding(14, dim, padding_idx=0)
             self.suit_embedding = nn.Embedding(5, dim, padding_idx=0)
             self.role_embedding = nn.Embedding(3, dim, padding_idx=0)
-            self.projection = nn.Sequential(nn.Linear(dim, config.hidden_dim), nn.GELU(), nn.LayerNorm(config.hidden_dim))
+            self.card_projection = nn.Sequential(
+                nn.Linear(dim * 3, dim),
+                nn.GELU(),
+                nn.LayerNorm(dim),
+            )
+            self.projection = nn.Sequential(
+                nn.Linear(dim * 2, config.hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(config.hidden_dim),
+            )
 
         def forward(self, ranks: Tensor, suits: Tensor, roles: Tensor, mask: Tensor) -> Tensor:
-            encoded = self.rank_embedding(ranks) + self.suit_embedding(suits) + self.role_embedding(roles)
-            weights = mask.unsqueeze(-1).to(encoded.dtype)
-            pooled = (encoded * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-            return self.projection(pooled)
+            card_tokens = torch.cat(
+                (
+                    self.rank_embedding(ranks),
+                    self.suit_embedding(suits),
+                    self.role_embedding(roles),
+                ),
+                dim=-1,
+            )
+            encoded = self.card_projection(card_tokens)
+            pooled_by_role = []
+            for role in (1, 2):  # 1 = hero hole cards, 2 = public board.
+                role_mask = (mask & (roles == role)).unsqueeze(-1).to(encoded.dtype)
+                pooled_by_role.append((encoded * role_mask).sum(dim=1) / role_mask.sum(dim=1).clamp_min(1.0))
+            return self.projection(torch.cat(pooled_by_role, dim=-1))
 
 
     class PlayerSetEncoder(nn.Module):
@@ -156,7 +186,7 @@ if TORCH_AVAILABLE:
 
 
     class HistoryEncoder(nn.Module):
-        """Small Transformer over public action-history tokens."""
+        """Small Transformer over ordered public action-history tokens."""
 
         def __init__(self, config: ModelConfig) -> None:
             super().__init__()
@@ -180,12 +210,36 @@ if TORCH_AVAILABLE:
         def forward(self, streets: Tensor, positions: Tensor, actions: Tensor, numeric: Tensor, mask: Tensor) -> Tensor:
             tokens = self.street_embedding(streets) + self.position_embedding(positions) + self.action_embedding(actions)
             tokens = tokens + self.numeric_projection(numeric)
+            tokens = tokens + self._positional_encoding(tokens)
             batch = tokens.shape[0]
             cls = self.cls.expand(batch, -1, -1)
             # The prepended CLS token means even a preflop observation with no
             # public actions has a valid Transformer sequence.
             encoded = self.encoder(torch.cat((cls, tokens), dim=1), src_key_padding_mask=torch.cat((torch.zeros((batch, 1), dtype=torch.bool, device=mask.device), ~mask), dim=1))
             return self.projection(encoded[:, 0])
+
+        @staticmethod
+        def _positional_encoding(tokens: Tensor) -> Tensor:
+            """Return parameter-free sinusoidal positions for any history length.
+
+            Histories are padded only after their real prefix, so these are the
+            chronological positions seen by the Transformer.  A generated
+            encoding avoids a fixed maximum sequence length and keeps batching
+            arbitrary-length hand histories straightforward.
+            """
+
+            length, dimension = tokens.shape[1], tokens.shape[2]
+            positions = torch.arange(length, device=tokens.device, dtype=tokens.dtype).unsqueeze(1)
+            frequencies = torch.exp(
+                torch.arange(0, dimension, 2, device=tokens.device, dtype=tokens.dtype)
+                * (-torch.log(torch.tensor(10000.0, device=tokens.device, dtype=tokens.dtype)) / dimension)
+            )
+            encoding = torch.zeros((length, dimension), device=tokens.device, dtype=tokens.dtype)
+            angles = positions * frequencies
+            encoding[:, 0::2] = torch.sin(angles)
+            if dimension > 1:
+                encoding[:, 1::2] = torch.cos(angles[:, : encoding[:, 1::2].shape[1]])
+            return encoding.unsqueeze(0)
 
 
     class PokerAgentModel(nn.Module):
@@ -286,6 +340,10 @@ if TORCH_AVAILABLE:
 
         @classmethod
         def load_checkpoint(cls, path: str | Path, *, map_location: str | torch.device = "cpu") -> "PokerAgentModel":
+            # Training checkpoints intentionally contain additional run state
+            # (optimizer/RNG/curriculum information).  The model payload stays
+            # at the top level, so inference can load either a small model-only
+            # checkpoint or a complete resumable-training checkpoint.
             checkpoint = torch.load(Path(path), map_location=map_location, weights_only=True)
             metadata = checkpoint.get("metadata")
             if not isinstance(metadata, Mapping):

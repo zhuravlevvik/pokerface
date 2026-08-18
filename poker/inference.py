@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Mapping, Protocol
 
 from .betting import Action
-from .bots import RuleBot, hand_strength
+from .bots import AggroBot, CallingStationBot, PokerBot, RandomBot, RuleBot, TightBot, hand_strength
 from .model import BET_SIZE_ACTIONS, PokerAgentModel
 
 
@@ -43,16 +43,61 @@ class DecisionService(Protocol):
         """Choose one currently legal engine action and return its explanation."""
 
 
+@dataclass(frozen=True)
+class PolicyIdentity:
+    """Stable, presentation-safe identity for a policy at a table seat.
+
+    ``policy_id`` is deliberately an identifier, rather than a filesystem
+    location.  The web client only ever sends this value back to the server;
+    checkpoint paths stay in the server-side catalog.
+    """
+
+    policy_id: str
+    name: str
+    kind: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"id": self.policy_id, "name": self.name, "kind": self.kind}
+
+
+def decision_identity(service: DecisionService) -> PolicyIdentity:
+    """Return a useful safe label for any decision service.
+
+    Third-party services are supported too, so existing ``GameServer`` users
+    do not have to wrap their service merely to use the observer.
+    """
+
+    identity = getattr(service, "identity", None)
+    if isinstance(identity, PolicyIdentity):
+        return identity
+    name = type(service).__name__
+    return PolicyIdentity(policy_id=f"service:{name}", name=name, kind="service")
+
+
+class IdentifiedDecisionService:
+    """Attach a safe catalog identity to an otherwise ordinary service."""
+
+    def __init__(self, service: DecisionService, identity: PolicyIdentity) -> None:
+        self.service = service
+        self.identity = identity
+
+    def decide(self, observation: Mapping[str, object]) -> InferenceResponse:
+        return self.service.decide(observation)
+
+
 class CheckpointInferenceService:
     """Inference-only wrapper around a :class:`PokerAgentModel` checkpoint."""
 
-    def __init__(self, model: PokerAgentModel) -> None:
+    def __init__(self, model: PokerAgentModel, *, policy_id: str = "checkpoint", name: str | None = None) -> None:
         self.model = model
         self.model.eval()
+        self.identity = PolicyIdentity(policy_id=policy_id, name=name or policy_id, kind="checkpoint")
 
     @classmethod
-    def from_checkpoint(cls, path: str) -> "CheckpointInferenceService":
-        return cls(PokerAgentModel.load_checkpoint(path))
+    def from_checkpoint(
+        cls, path: str, *, policy_id: str = "checkpoint", name: str | None = None
+    ) -> "CheckpointInferenceService":
+        return cls(PokerAgentModel.load_checkpoint(path), policy_id=policy_id, name=name)
 
     def decide(self, observation: Mapping[str, object]) -> InferenceResponse:
         decision = self.model.infer(observation)
@@ -67,16 +112,12 @@ class CheckpointInferenceService:
         )
 
 
-class HeuristicInferenceService:
-    """Deterministic UI fallback when no trained checkpoint is supplied.
+class BotInferenceService:
+    """Adapt a baseline :class:`PokerBot` to the normal inference contract."""
 
-    It preserves the response contract so UI and game-server work can be
-    developed before training produces its first checkpoint.  The returned
-    equity is explicitly a cheap hand-strength proxy, not Monte-Carlo equity.
-    """
-
-    def __init__(self) -> None:
-        self.bot = RuleBot()
+    def __init__(self, bot: PokerBot, *, policy_id: str, name: str) -> None:
+        self.bot = bot
+        self.identity = PolicyIdentity(policy_id=policy_id, name=name, kind="bot")
 
     def decide(self, observation: Mapping[str, object]) -> InferenceResponse:
         selected = self.bot.select_action(observation)
@@ -87,16 +128,59 @@ class HeuristicInferenceService:
         if selected.value in bet_size_probabilities:
             bet_size_probabilities[selected.value] = 1.0
         strength = hand_strength(observation)
-        # This deliberately has no tie estimate; a trained equity head replaces
-        # it when a checkpoint is configured.
-        equity = {"win": strength, "tie": 0.0, "loss": 1.0 - strength, "total": strength}
         return InferenceResponse(
             action=selected.value,
             action_probabilities=action_probabilities,
             bet_size_probabilities=bet_size_probabilities,
-            equity=equity,
+            equity={"win": strength, "tie": 0.0, "loss": 1.0 - strength, "total": strength},
             value_bb=(strength - 0.5) * float(observation["pot"]) / 100,
         )
+
+
+class HeuristicInferenceService(BotInferenceService):
+    """Deterministic UI fallback when no trained checkpoint is supplied.
+
+    It preserves the response contract so UI and game-server work can be
+    developed before training produces its first checkpoint.  The returned
+    equity is explicitly a cheap hand-strength proxy, not Monte-Carlo equity.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(RuleBot(), policy_id="bot:rule", name="Rule bot")
+
+
+_BOT_TYPES: dict[str, tuple[str, type[PokerBot]]] = {
+    "random": ("Random bot", RandomBot),
+    "tight": ("Tight bot", TightBot),
+    "aggro": ("Aggro bot", AggroBot),
+    "calling_station": ("Calling station", CallingStationBot),
+    "rule": ("Rule bot", RuleBot),
+}
+
+
+def baseline_policy(policy_id: str, *, seed: int | None = None) -> BotInferenceService:
+    """Build one fresh baseline service from a safe ``bot:<name>`` id."""
+
+    if not policy_id.startswith("bot:"):
+        raise ValueError("baseline policy id must start with 'bot:'")
+    bot_key = policy_id.removeprefix("bot:")
+    try:
+        name, bot_type = _BOT_TYPES[bot_key]
+    except KeyError as error:
+        raise ValueError(f"unknown baseline policy {policy_id!r}") from error
+    # Only stochastic bots accept a seed.  Keeping RuleBot/TightBot's simple
+    # constructor also makes custom baseline implementations easy to add.
+    try:
+        bot = bot_type(seed=seed)  # type: ignore[call-arg]
+    except TypeError:
+        bot = bot_type()
+    return BotInferenceService(bot, policy_id=policy_id, name=name)
+
+
+def baseline_policy_catalog() -> list[dict[str, str]]:
+    """Return presentation-safe options for UI and CLI policy selectors."""
+
+    return [PolicyIdentity(f"bot:{key}", name, "bot").as_dict() for key, (name, _) in _BOT_TYPES.items()]
 
 
 def validate_response(response: InferenceResponse, legal_actions: Mapping[str, bool]) -> None:

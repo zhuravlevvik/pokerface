@@ -21,7 +21,7 @@ from .game_state import HandState
 from .league import ModelPolicy
 from .model import ACTION_NAMES, BET_SIZE_ACTIONS, TORCH_AVAILABLE
 from .observation import observation_for
-from .rules import BIG_BLIND, SEAT_COUNT
+from .rules import BIG_BLIND, SEAT_COUNT, positions
 from .traces import HandTrace
 
 
@@ -36,7 +36,7 @@ class EvaluablePolicy(Protocol):
 class EvaluationConfig:
     """Fixed holdout protocol.
 
-    ``hands_per_opponent`` must be a multiple of five.  This makes candidate
+    ``hands_per_opponent`` must be a multiple of ``player_count``.  This makes candidate
     seat/position exposure exactly equal rather than merely approximately
     balanced, which is especially important with the fixed button seat used by
     the cash-game engine.
@@ -46,18 +46,24 @@ class EvaluationConfig:
     seed_start: int = 100_000
     starting_stack: int = 10_000
     player_count: int = SEAT_COUNT
+    allowed_raise_actions: tuple[Action, ...] | None = None
     equity_samples: int = 16
     calibration_bins: int = 10
 
     def __post_init__(self) -> None:
-        if self.player_count != SEAT_COUNT:
-            raise ValueError("evaluation currently requires the canonical 5-max table")
-        if self.hands_per_opponent < SEAT_COUNT or self.hands_per_opponent % SEAT_COUNT:
-            raise ValueError("hands_per_opponent must be a positive multiple of five for fair rotation")
+        if not 2 <= self.player_count <= SEAT_COUNT:
+            raise ValueError(f"player_count must be in 2..{SEAT_COUNT}")
+        if self.hands_per_opponent < self.player_count or self.hands_per_opponent % self.player_count:
+            raise ValueError("hands_per_opponent must be a positive multiple of player_count for fair rotation")
         if self.starting_stack < BIG_BLIND:
             raise ValueError("starting_stack must cover the big blind")
         if self.equity_samples < 1 or self.calibration_bins < 1:
             raise ValueError("equity_samples and calibration_bins must be positive")
+        if self.allowed_raise_actions is not None:
+            normalized = tuple(Action(action) for action in self.allowed_raise_actions)
+            if not normalized or any(action not in RAISE_ACTIONS | {Action.ALL_IN} for action in normalized):
+                raise ValueError("allowed_raise_actions must contain only raise sizes and all-in")
+            object.__setattr__(self, "allowed_raise_actions", normalized)
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,9 @@ class MatchupReport:
     hands: int
     pnl_bb: float
     bb_per_100: float
+    bb_per_100_standard_error: float
+    bb_per_100_ci95_low: float
+    bb_per_100_ci95_high: float
     win_rate: float
     tie_rate: float
     league_score: float
@@ -152,7 +161,7 @@ class EvaluationSuiteReport:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "candidate": self.candidate,
             "config": asdict(self.config),
             "aggregate_bb_per_100": self.aggregate_bb_per_100,
@@ -201,10 +210,11 @@ def evaluate_suite(
 ) -> EvaluationSuiteReport:
     """Evaluate ``candidate`` against every fixed baseline/checkpoint.
 
-    Each supplied opponent fills the other four seats.  The candidate moves one
-    seat each hand, so every opponent matchup has exact 1/5 exposure to BTN,
-    SB, BB, UTG and CO.  Every matchup receives the same seed range; comparison
-    is therefore not confounded by a luckier set of boards.
+    Each supplied opponent fills every non-candidate seat.  The candidate moves
+    one seat each hand, so every matchup has exact exposure to every position
+    for its table size.  Every matchup receives the same seed range; evaluating
+    another candidate with the same protocol therefore uses common random
+    numbers and is not confounded by a luckier set of boards.
     """
 
     if not candidate_name:
@@ -236,18 +246,27 @@ def _evaluate_matchup(
     candidate_policy = _evaluation_copy(candidate)
     opponent_policy = _evaluation_copy(opponent)
     style = _StyleCounters()
-    position_hands = {position: 0 for position in ("BTN", "SB", "BB", "UTG", "CO")}
+    position_names = tuple(positions(0, player_count=config.player_count).values())
+    position_hands = {position: 0 for position in position_names}
     pnl_by_position = {position: 0.0 for position in position_hands}
     total_pnl = 0.0
+    hand_pnl: list[float] = []
     winning_hands = 0
     tied_hands = 0
     model_accumulator = _ModelAccumulator([], [], equity_predictions=[], equity_targets=[]) if isinstance(candidate_policy, ModelPolicy) else None
 
     for hand_index in range(config.hands_per_opponent):
         # Button remains stable; rotating the candidate's physical seat rotates
-        # its poker position exactly once per five hands.
+        # its poker position exactly once per full player-count block.
         candidate_seat = hand_index % config.player_count
-        state = HandState(seed=config.seed_start + hand_index, starting_stack=config.starting_stack)
+        state = HandState(
+            seed=config.seed_start + hand_index,
+            starting_stack=config.starting_stack,
+            player_count=config.player_count,
+            allowed_raise_actions=None
+            if config.allowed_raise_actions is None
+            else frozenset(config.allowed_raise_actions),
+        )
         position = state.positions[candidate_seat]
         position_hands[position] += 1
         style.hands += 1
@@ -311,6 +330,7 @@ def _evaluate_matchup(
         trace.complete(state)
         pnl = (state.player(candidate_seat).stack - config.starting_stack) / BIG_BLIND
         total_pnl += pnl
+        hand_pnl.append(pnl)
         pnl_by_position[position] += pnl
         winning_hands += pnl > 0
         tied_hands += pnl == 0
@@ -337,11 +357,22 @@ def _evaluate_matchup(
             bins=config.calibration_bins,
         )
     hands = config.hands_per_opponent
+    bb_per_100 = total_pnl / hands * 100.0
+    if hands > 1:
+        mean = total_pnl / hands
+        variance = sum((value - mean) ** 2 for value in hand_pnl) / (hands - 1)
+        standard_error = sqrt(variance / hands) * 100.0
+    else:  # Config currently requires at least two hands; kept defensive.
+        standard_error = 0.0
+    margin = 1.96 * standard_error
     return MatchupReport(
         opponent=opponent_name,
         hands=hands,
         pnl_bb=total_pnl,
-        bb_per_100=total_pnl / hands * 100.0,
+        bb_per_100=bb_per_100,
+        bb_per_100_standard_error=standard_error,
+        bb_per_100_ci95_low=bb_per_100 - margin,
+        bb_per_100_ci95_high=bb_per_100 + margin,
         win_rate=winning_hands / hands,
         tie_rate=tied_hands / hands,
         league_score=(winning_hands + 0.5 * tied_hands) / hands,

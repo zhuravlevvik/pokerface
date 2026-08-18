@@ -72,3 +72,26 @@ poker.web           optional FastAPI HTTP/WebSocket adapter + static browser UI
 Spectator-mode раскрывает все карты только в terminal snapshot. Оба replay
 содержат seed и action log и потому детерминированно импортируются обратно;
 player replay при этом не требует раскрывать карты соперников.
+
+## Mixed-policy просмотр
+
+Стол поддерживает 2, 3 и 5 игроков. Для каждого места в UI можно выбрать
+baseline-бота или checkpoint из каталога, настроенного на сервере. Браузер
+передаёт только безопасный id вида `bot:rule` или `checkpoint:hu-best`; путь
+к файлу checkpoint остаётся на стороне процесса сервера.
+
+Удобный запуск каталога и заранее выбранных мест:
+
+```bash
+.venv/bin/python -m poker.watch \
+  --checkpoint hu-best=runs/hu/checkpoints/best.pt \
+  --seat checkpoint:hu-best --seat bot:rule \
+  --players 2 --hands 3 --seed 42000
+```
+
+При editable install ту же команду можно запустить как `pokerface-watch`.
+
+В интерфейсе доступны серия раздач, пауза, покадровый переход по ходам,
+переход к следующей раздаче, скорость воспроизведения и экспорт последнего
+replay. Серия использует последовательные seed (`seed`, `seed + 1`, ...), а
+кнопка download сохраняет самодостаточный replay выбранной раздачи.
