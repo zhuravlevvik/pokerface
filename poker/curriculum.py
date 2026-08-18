@@ -267,6 +267,14 @@ class PretrainingExample:
     equity_target: tuple[float, float, float]
     terminal_pnl_bb: float
     stage: CurriculumStage
+    # Audit fields are appended so existing positional construction remains
+    # valid.  They are populated by trace-backed corpus generation.
+    hand_id: int | None = None
+    seed: int | None = None
+    equity_samples: int | None = None
+    equity_exact: bool | None = None
+    label_protocol: str | None = None
+    behavior_policy: str | None = None
 
 
 class TracePretrainingDataset(Sequence[PretrainingExample]):
@@ -291,7 +299,25 @@ class TracePretrainingDataset(Sequence[PretrainingExample]):
                 pnl = record["terminal_pnl_bb"]
                 if not isinstance(target, list) or len(target) != 3 or not isinstance(pnl, (int, float)):
                     raise ValueError("terminal trace has malformed equity supervision")
-                examples.append(PretrainingExample(record["observation"], str(record["selected_action"]), tuple(float(value) for value in target), float(pnl), resolved))
+                samples = record.get("equity_samples")
+                exact = record.get("equity_exact")
+                hand_id = record.get("hand_id")
+                seed = record.get("seed")
+                label_protocol = record.get("label_protocol")
+                examples.append(
+                    PretrainingExample(
+                        record["observation"],
+                        str(record["selected_action"]),
+                        tuple(float(value) for value in target),
+                        float(pnl),
+                        resolved,
+                        hand_id if isinstance(hand_id, int) else None,
+                        seed if isinstance(seed, int) else None,
+                        samples if isinstance(samples, int) else None,
+                        exact if isinstance(exact, bool) else None,
+                        label_protocol if isinstance(label_protocol, str) else None,
+                    )
+                )
         return cls(examples)
 
     def equity_quality(self, predictions: Iterable[Sequence[float]]) -> Mapping[str, Any]:

@@ -58,6 +58,24 @@ def test_pre_river_target_is_soft_reproducible_and_uses_runouts() -> None:
     assert all(value * 16 == pytest.approx(round(value * 16)) for value in first.probabilities)
 
 
+def test_turn_target_enumerates_exactly_when_budget_covers_all_rivers() -> None:
+    known = _cards("Ah", "Ad", "Kc", "Kd", "2c", "3d", "4h", "5s")
+    remaining = tuple(card for suit in ("c", "d", "h", "s") for rank in range(2, 15) if (card := Card(rank, suit)) not in known)
+    snapshot = EquitySnapshot(
+        hero_seat=0,
+        hero_hole_cards=known[:2],  # type: ignore[arg-type]
+        opponent_hole_cards=(known[2:4],),  # type: ignore[arg-type]
+        board=known[4:],
+        remaining_deck=remaining,
+    )
+
+    target = generate_equity_target(snapshot, samples=len(remaining))
+
+    assert target.exact is True
+    assert target.samples == len(remaining) == 44
+    assert sum(target.probabilities) == pytest.approx(1.0)
+
+
 def test_training_trace_exposes_label_but_never_private_label_context() -> None:
     environment = BatchedHoldemEnvironment(1)
     observations = environment.reset(seeds=[44])
