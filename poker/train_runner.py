@@ -8,7 +8,8 @@ can always be resumed without trying to reconstruct a half-consumed rollout.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from hashlib import sha256
 from pathlib import Path
 import json
 import os
@@ -19,9 +20,10 @@ from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from .bots import AggroBot, CallingStationBot, RandomBot, RuleBot, TightBot
-from .curriculum import CurriculumConfig, CurriculumStage, StageScheduler
+from .curriculum import CurriculumConfig, CurriculumStage, StageScheduler, stage_spec
 from .league import BotPolicy, LeagueMember, ModelPolicy, OpponentLeague
 from .model import ModelConfig, TORCH_AVAILABLE, PokerAgentModel
+from .promotion import PromotionConfig, PromotionEvaluation, PromotionEvaluator
 from .training import PPOConfig, PPOTrainer, UpdateMetrics
 
 if TORCH_AVAILABLE:
@@ -120,6 +122,10 @@ class TrainingRunConfig:
     ppo: PPOConfig = field(default_factory=PPOConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     league: LeagueConfig = field(default_factory=LeagueConfig)
+    promotion: PromotionConfig = field(default_factory=PromotionConfig)
+    # This is deliberately model-only initialization, never a continuation of
+    # optimizer, RNG, league, or rollout state from another run.
+    init_checkpoint: str | None = None
 
     def __post_init__(self) -> None:
         if self.ppo.learning_rate != self.curriculum.base_learning_rate:
@@ -127,6 +133,10 @@ class TrainingRunConfig:
                 "ppo.learning_rate and curriculum.base_learning_rate must match; "
                 "curriculum stage scaling is applied to this shared base"
             )
+        if self.init_checkpoint is not None and (not isinstance(self.init_checkpoint, str) or not self.init_checkpoint.strip()):
+            raise ValueError("init_checkpoint must be a non-empty path string or null")
+        if self.promotion.enabled and stage_spec(self.run.stage).player_count != 2:
+            raise ValueError("the current promotion protocol can only be enabled for heads-up stages A/B")
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -152,12 +162,20 @@ class TrainingRunConfig:
             league_data["members"] = tuple(LeagueMemberConfig(**dict(member)) for member in members_data if isinstance(member, Mapping))
             if len(league_data["members"]) != len(members_data):
                 raise ValueError("each league member must be an object")
+        promotion_data = mapping("promotion")
+        baseline_bots = promotion_data.get("baseline_bots")
+        if baseline_bots is not None:
+            if not isinstance(baseline_bots, Sequence) or isinstance(baseline_bots, (str, bytes)):
+                raise ValueError("promotion.baseline_bots must be an array")
+            promotion_data["baseline_bots"] = tuple(baseline_bots)
         return cls(
             run=RunSettings(**run_data),
             model=ModelConfig(**mapping("model")),
             ppo=PPOConfig(**mapping("ppo")),
             curriculum=CurriculumConfig(**mapping("curriculum")),
             league=LeagueConfig(**league_data),
+            promotion=PromotionConfig(**promotion_data),
+            init_checkpoint=data.get("init_checkpoint"),
         )
 
 
@@ -209,6 +227,19 @@ def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def _fsync_file(path: Path) -> None:
@@ -337,7 +368,10 @@ def _restore_league(state: Mapping[str, Any], current_model: PokerAgentModel) ->
             checkpoint_path = policy_data.get("checkpoint_path")
             if not isinstance(checkpoint_path, str):
                 raise ValueError(f"saved league model {name!r} has no checkpoint path")
-            policy = ModelPolicy.from_checkpoint(name, checkpoint_path)
+            try:
+                policy = ModelPolicy.from_checkpoint(name, checkpoint_path)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"saved league model {name!r} is missing or incompatible: {checkpoint_path}") from error
         elif policy_type == "bot":
             bot_data = policy_data.get("bot")
             if not isinstance(bot_data, Mapping):
@@ -392,16 +426,34 @@ class TrainingRunResult:
 class TrainingRunner:
     """Durable owner of a PPO run and its safe checkpoint boundaries."""
 
-    def __init__(self, config: TrainingRunConfig, run_directory: str | Path, *, device: str | None = None) -> None:
+    def __init__(
+        self,
+        config: TrainingRunConfig,
+        run_directory: str | Path,
+        *,
+        device: str | None = None,
+        init_checkpoint: str | Path | None = None,
+    ) -> None:
         _require_torch()
-        self.config = config
         self.run_directory = Path(run_directory)
         self.checkpoint_directory = self.run_directory / "checkpoints"
         self.checkpoint_directory.mkdir(parents=True, exist_ok=True)
         self.device = device
+        configured_init = config.init_checkpoint
+        if init_checkpoint is not None and configured_init is not None and Path(init_checkpoint) != Path(configured_init):
+            raise ValueError("init checkpoint was specified both in config and constructor with different paths")
+        self.init_checkpoint = Path(init_checkpoint) if init_checkpoint is not None else (Path(configured_init) if configured_init is not None else None)
+        if self.init_checkpoint is not None and config.init_checkpoint is None:
+            config = replace(config, init_checkpoint=str(self.init_checkpoint))
+        self.config = config
         self._seed_everything(config.run.seed)
         self.scheduler = StageScheduler(config.curriculum, initial_stage=config.run.stage)
         self.model = PokerAgentModel(config.model)
+        if self.init_checkpoint is not None:
+            self._load_initial_model_weights(self.init_checkpoint)
+            # Loading a source model constructs modules and may consume global
+            # RNG.  A fresh PPO run must begin from its own configured stream.
+            self._seed_everything(config.run.seed)
         self.league = build_league(config.league, self.model, fallback_seed=config.run.seed)
         self.trainer = PPOTrainer(self.model, self.league, config.ppo, device=device)
         self._apply_stage_learning_rate()
@@ -410,7 +462,29 @@ class TrainingRunner:
         self.global_decisions = 0
         self.global_hands = 0
         self.best_score: float | None = None
+        self.last_evaluation_iteration = -1
+        self.pending_promotion_iteration: int | None = None
+        self.promotion_evaluator = (
+            PromotionEvaluator(config.promotion, self.run_directory, run_seed=config.run.seed)
+            if config.promotion.enabled
+            else None
+        )
+        if self.promotion_evaluator is not None and self.promotion_evaluator.last_evaluated_iteration >= 0:
+            raise ValueError("run directory already contains promotion state; use --resume")
         self.manifest: dict[str, Any] = {"version": 1, "checkpoints": []}
+        if self.init_checkpoint is not None:
+            self.manifest["initialization"] = {
+                "kind": "model_weights_only",
+                "checkpoint": str(self.init_checkpoint),
+                "checkpoint_sha256": _file_sha256(self.init_checkpoint),
+                "metadata": self.model.checkpoint_metadata(),
+            }
+        if self.promotion_evaluator is not None:
+            self.manifest["promotion"] = {
+                "enabled": True,
+                "archive_manifest": str(self.promotion_evaluator.archive_manifest_path),
+                "evaluations": [],
+            }
         self._stop_requested = False
         self._last_checkpoint_time = time.monotonic()
         self._last_checkpoint_decisions = 0
@@ -422,6 +496,19 @@ class TrainingRunner:
         for group in self.trainer.optimizer.param_groups:
             group["lr"] = effective
         return effective
+
+    def _load_initial_model_weights(self, path: Path) -> None:
+        """Load only compatible network weights for a new independent run."""
+
+        source = PokerAgentModel.load_checkpoint(path, map_location="cpu")
+        expected = self.model.checkpoint_metadata()
+        actual = source.checkpoint_metadata()
+        # Model metadata includes architecture config.  Checking the complete
+        # contract prevents a partial state-dict load or silently changing the
+        # target run's declared observation/action-space interface.
+        if actual != expected:
+            raise ValueError("init checkpoint model metadata/config does not match the new PPO run")
+        self.model.load_state_dict(source.state_dict(), strict=True)
 
     @staticmethod
     def _seed_everything(seed: int) -> None:
@@ -460,6 +547,16 @@ class TrainingRunner:
             "league": _league_state(self.league),
             "rng": _rng_state(),
             "best_score": self.best_score,
+            "promotion_state": {
+                "last_evaluation_iteration": self.last_evaluation_iteration,
+                "pending_promotion_iteration": self.pending_promotion_iteration,
+                "archive_manifest": None
+                if self.promotion_evaluator is None
+                else str(self.promotion_evaluator.archive_manifest_path),
+                "archive_manifest_sha256": None
+                if self.promotion_evaluator is None or not self.promotion_evaluator.archive_manifest_path.exists()
+                else _file_sha256(self.promotion_evaluator.archive_manifest_path),
+            },
             "effective_learning_rate": self.trainer.optimizer.param_groups[0]["lr"],
             "manifest": self.manifest,
             "checkpoint_control": {"last_checkpoint_decisions": self._last_checkpoint_decisions},
@@ -515,6 +612,7 @@ class TrainingRunner:
         instance.run_directory = checkpoint_path.parent.parent
         instance.checkpoint_directory = instance.run_directory / "checkpoints"
         instance.device = device
+        instance.init_checkpoint = Path(config.init_checkpoint) if config.init_checkpoint is not None else None
         curriculum_config_data = curriculum.get("config")
         stage = curriculum.get("stage")
         if not isinstance(curriculum_config_data, Mapping) or not isinstance(stage, str):
@@ -544,10 +642,67 @@ class TrainingRunner:
         if best_score is not None and not isinstance(best_score, (int, float)):
             raise ValueError("checkpoint has invalid best score")
         instance.best_score = None if best_score is None else float(best_score)
+        promotion_state = payload.get("promotion_state", {})
+        if not isinstance(promotion_state, Mapping):
+            raise ValueError("checkpoint has invalid promotion state")
+        saved_last_evaluation = promotion_state.get("last_evaluation_iteration", -1)
+        if not isinstance(saved_last_evaluation, int) or saved_last_evaluation < -1:
+            raise ValueError("checkpoint has invalid last evaluation iteration")
+        pending_promotion = promotion_state.get("pending_promotion_iteration")
+        if pending_promotion is not None and (
+            not isinstance(pending_promotion, int)
+            or pending_promotion < 1
+            or pending_promotion != instance.iteration
+        ):
+            raise ValueError("checkpoint has invalid pending promotion iteration")
+        instance.promotion_evaluator = (
+            PromotionEvaluator(config.promotion, instance.run_directory, run_seed=config.run.seed)
+            if config.promotion.enabled
+            else None
+        )
+        if instance.promotion_evaluator is None:
+            instance.last_evaluation_iteration = saved_last_evaluation
+            instance.pending_promotion_iteration = pending_promotion
+        else:
+            archive_last = instance.promotion_evaluator.last_evaluated_iteration
+            if archive_last > instance.iteration:
+                raise ValueError("promotion archive is ahead of the restored training iteration")
+            saved_archive_sha = promotion_state.get("archive_manifest_sha256")
+            if archive_last == saved_last_evaluation and saved_archive_sha is not None:
+                if not isinstance(saved_archive_sha, str) or _file_sha256(instance.promotion_evaluator.archive_manifest_path) != saved_archive_sha:
+                    raise ValueError("promotion archive manifest does not match full-run checkpoint")
+            if archive_last < saved_last_evaluation:
+                raise ValueError("promotion archive is behind the restored full-run checkpoint")
+            if archive_last > saved_last_evaluation and pending_promotion != archive_last:
+                raise ValueError("promotion archive is ahead without a matching durable promotion intent")
+            archive_decisions = instance.promotion_evaluator.archive_manifest.get("decisions", [])
+            if not isinstance(archive_decisions, list):
+                raise ValueError("promotion archive decisions are malformed")
+            for archive_decision in archive_decisions:
+                if not isinstance(archive_decision, Mapping) or not isinstance(archive_decision.get("iteration"), int):
+                    raise ValueError("promotion archive contains an invalid decision iteration")
+                instance._validate_recovered_promotion(archive_decision["iteration"])
+            instance.promotion_evaluator.synchronize_league(instance.league)
+            instance.last_evaluation_iteration = max(saved_last_evaluation, archive_last)
+            instance.pending_promotion_iteration = (
+                None
+                if pending_promotion is not None and instance.last_evaluation_iteration >= pending_promotion
+                else pending_promotion
+            )
+            if instance.promotion_evaluator.champion_score is not None:
+                instance.best_score = instance.promotion_evaluator.champion_score
         manifest = payload.get("manifest", {"version": 1, "checkpoints": []})
         if not isinstance(manifest, Mapping):
             raise ValueError("checkpoint has invalid manifest")
         instance.manifest = dict(manifest)
+        if instance.promotion_evaluator is not None:
+            section = instance.manifest.setdefault(
+                "promotion",
+                {"enabled": True, "archive_manifest": str(instance.promotion_evaluator.archive_manifest_path), "evaluations": []},
+            )
+            if not isinstance(section, dict):
+                raise ValueError("checkpoint manifest has invalid promotion section")
+            section["evaluations"] = list(instance.promotion_evaluator.archive_manifest.get("decisions", []))
         instance._stop_requested = False
         instance._last_checkpoint_time = time.monotonic()
         control = payload.get("checkpoint_control", {})
@@ -570,6 +725,70 @@ class TrainingRunner:
             return True
         seconds = self.config.run.checkpoint_every_seconds
         return seconds is not None and time.monotonic() - self._last_checkpoint_time >= seconds
+
+    def _run_promotion(self, metrics: UpdateMetrics | None = None) -> PromotionEvaluation:
+        if self.promotion_evaluator is None:
+            raise RuntimeError("promotion is not enabled for this run")
+        # Publish a frozen full-run source before evaluation.  If a process
+        # died after this boundary, the same immutable source is reused.
+        self.pending_promotion_iteration = self.iteration
+        source = self.checkpoint_directory / f"candidate_{self.iteration:08d}.pt"
+        if not source.exists():
+            source = self.save_checkpoint(reason="candidate", metrics=metrics)
+        rng = _rng_state()
+        try:
+            result = self.promotion_evaluator.evaluate_and_promote(
+                iteration=self.iteration,
+                candidate_checkpoint=source,
+                league=self.league,
+                stage=self.scheduler.stage,
+                champion_score=self.best_score,
+                run_context={
+                    "iteration": self.iteration,
+                    "global_decisions": self.global_decisions,
+                    "global_hands": self.global_hands,
+                    "run_config_sha256": _canonical_sha256(self.config.to_dict()),
+                },
+            )
+        finally:
+            # Loading frozen evaluation/archive models constructs modules;
+            # promotion must not perturb the learner's next stochastic rollout.
+            _restore_rng_state(rng)
+        self.last_evaluation_iteration = self.iteration
+        self.pending_promotion_iteration = None
+        if result.accepted:
+            self.best_score = result.baseline_score_bb_per_100
+        section = self.manifest.setdefault("promotion", {"enabled": True, "evaluations": []})
+        if not isinstance(section, dict) or not isinstance(section.setdefault("evaluations", []), list):
+            raise ValueError("run manifest promotion section is corrupted")
+        archive_decisions = self.promotion_evaluator.archive_manifest.get("decisions", [])
+        if not isinstance(archive_decisions, list) or not archive_decisions:
+            raise ValueError("promotion completed without an archive decision record")
+        record = dict(archive_decisions[-1])
+        evaluations = section["evaluations"]
+        if not evaluations or evaluations[-1] != record:
+            evaluations.append(record)
+        self.save_checkpoint(reason="promotion", metrics=metrics)
+        return result
+
+    def _validate_recovered_promotion(self, iteration: int) -> None:
+        if self.promotion_evaluator is None:
+            raise RuntimeError("promotion recovery requires an evaluator")
+        decisions = self.promotion_evaluator.archive_manifest.get("decisions", [])
+        if not isinstance(decisions, list):
+            raise ValueError("promotion archive decisions are malformed")
+        decision = next((item for item in decisions if item.get("iteration") == iteration), None)
+        if not isinstance(decision, Mapping):
+            raise ValueError("promotion archive lacks the expected iteration decision")
+        source = self.checkpoint_directory / f"candidate_{iteration:08d}.pt"
+        if not source.exists() or decision.get("source_full_checkpoint_sha256") != _file_sha256(source):
+            raise ValueError("promotion decision does not match this run's frozen full checkpoint")
+        report_path = Path(str(decision.get("report_path")))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        candidate = report.get("candidate") if isinstance(report, Mapping) else None
+        run_context = candidate.get("run_context") if isinstance(candidate, Mapping) else None
+        if not isinstance(run_context, Mapping) or run_context.get("run_config_sha256") != _canonical_sha256(self.config.to_dict()):
+            raise ValueError("promotion report does not match this run configuration")
 
     def _train_one_iteration(self) -> UpdateMetrics:
         spec = self.scheduler.spec
@@ -612,13 +831,35 @@ class TrainingRunner:
         if install_signal_handlers:
             old_handler = signal.signal(signal.SIGINT, on_interrupt)
         try:
+            if self.pending_promotion_iteration is not None:
+                self._run_promotion()
+                if self._stop_requested:
+                    path = self.save_checkpoint(reason="interrupt")
+                    return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
             while self.iteration < target:
                 metrics = self._train_one_iteration()
                 if self._stop_requested:
                     path = self.save_checkpoint(reason="interrupt", metrics=metrics)
                     return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
+                if self.promotion_evaluator is not None and self.promotion_evaluator.should_evaluate(
+                    self.iteration,
+                    last_evaluation_iteration=self.last_evaluation_iteration,
+                ):
+                    self._run_promotion(metrics)
+                    if self._stop_requested:
+                        path = self.save_checkpoint(reason="interrupt", metrics=metrics)
+                        return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
                 if self._should_checkpoint():
                     self.save_checkpoint(metrics=metrics)
+            if self.promotion_evaluator is not None and self.promotion_evaluator.should_evaluate(
+                self.iteration,
+                completing=True,
+                last_evaluation_iteration=self.last_evaluation_iteration,
+            ):
+                self._run_promotion()
+                if self._stop_requested:
+                    path = self.save_checkpoint(reason="interrupt")
+                    return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
             path = self.save_checkpoint(reason="complete")
             return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, False, path)
         finally:

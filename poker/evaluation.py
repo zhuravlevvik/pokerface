@@ -12,8 +12,10 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from json import dumps
 from math import isfinite, sqrt
+import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+from uuid import uuid4
 
 from .betting import Action, RAISE_ACTIONS
 from .equity import EquityMetrics, equity_metrics
@@ -39,7 +41,8 @@ class EvaluationConfig:
     ``hands_per_opponent`` must be a multiple of ``player_count``.  This makes candidate
     seat/position exposure exactly equal rather than merely approximately
     balanced, which is especially important with the fixed button seat used by
-    the cash-game engine.
+    the cash-game engine.  With ``paired_position_seeds``, each deal seed is
+    repeated once per candidate seat and confidence intervals use deal blocks.
     """
 
     hands_per_opponent: int = 100
@@ -49,6 +52,7 @@ class EvaluationConfig:
     allowed_raise_actions: tuple[Action, ...] | None = None
     equity_samples: int = 16
     calibration_bins: int = 10
+    paired_position_seeds: bool = False
 
     def __post_init__(self) -> None:
         if not 2 <= self.player_count <= SEAT_COUNT:
@@ -117,6 +121,8 @@ class MatchupReport:
 
     opponent: str
     hands: int
+    seed_blocks: int
+    ci_method: str
     pnl_bb: float
     bb_per_100: float
     bb_per_100_standard_error: float
@@ -161,7 +167,7 @@ class EvaluationSuiteReport:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "candidate": self.candidate,
             "config": asdict(self.config),
             "aggregate_bb_per_100": self.aggregate_bb_per_100,
@@ -175,7 +181,23 @@ class EvaluationSuiteReport:
 
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(dumps(self.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(dumps(self.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            try:
+                descriptor = os.open(destination.parent, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            except OSError:  # pragma: no cover - filesystem dependent.
+                pass
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         return destination
 
 
@@ -243,8 +265,8 @@ def _evaluate_matchup(
     # Some baselines carry an instance-local RNG.  Evaluation must not mutate
     # caller-owned policies, otherwise repeating the same suite changes the
     # answer despite fixed deal seeds.
-    candidate_policy = _evaluation_copy(candidate)
-    opponent_policy = _evaluation_copy(opponent)
+    candidate_template = _evaluation_copy(candidate)
+    opponent_template = _evaluation_copy(opponent)
     style = _StyleCounters()
     position_names = tuple(positions(0, player_count=config.player_count).values())
     position_hands = {position: 0 for position in position_names}
@@ -253,20 +275,26 @@ def _evaluate_matchup(
     hand_pnl: list[float] = []
     winning_hands = 0
     tied_hands = 0
-    model_accumulator = _ModelAccumulator([], [], equity_predictions=[], equity_targets=[]) if isinstance(candidate_policy, ModelPolicy) else None
+    model_accumulator = _ModelAccumulator([], [], equity_predictions=[], equity_targets=[]) if isinstance(candidate_template, ModelPolicy) else None
 
     for hand_index in range(config.hands_per_opponent):
         # Button remains stable; rotating the candidate's physical seat rotates
         # its poker position exactly once per full player-count block.
         candidate_seat = hand_index % config.player_count
+        deal_index = hand_index // config.player_count if config.paired_position_seeds else hand_index
+        deal_seed = config.seed_start + deal_index
         state = HandState(
-            seed=config.seed_start + hand_index,
+            seed=deal_seed,
             starting_stack=config.starting_stack,
             player_count=config.player_count,
             allowed_raise_actions=None
             if config.allowed_raise_actions is None
             else frozenset(config.allowed_raise_actions),
         )
+        candidate_policy = _evaluation_copy(candidate_template)
+        opponent_policy = _evaluation_copy(opponent_template)
+        _seed_evaluation_policy(candidate_policy, deal_seed * 2)
+        _seed_evaluation_policy(opponent_policy, deal_seed * 2 + 1)
         position = state.positions[candidate_seat]
         position_hands[position] += 1
         style.hands += 1
@@ -358,16 +386,27 @@ def _evaluate_matchup(
         )
     hands = config.hands_per_opponent
     bb_per_100 = total_pnl / hands * 100.0
-    if hands > 1:
-        mean = total_pnl / hands
-        variance = sum((value - mean) ** 2 for value in hand_pnl) / (hands - 1)
-        standard_error = sqrt(variance / hands) * 100.0
+    if config.paired_position_seeds:
+        block_values = [
+            sum(hand_pnl[start : start + config.player_count]) / config.player_count
+            for start in range(0, hands, config.player_count)
+        ]
+        ci_method = "paired_position_seed_block_normal_v1"
+    else:
+        block_values = hand_pnl
+        ci_method = "independent_hand_normal_v1"
+    if len(block_values) > 1:
+        mean = sum(block_values) / len(block_values)
+        variance = sum((value - mean) ** 2 for value in block_values) / (len(block_values) - 1)
+        standard_error = sqrt(variance / len(block_values)) * 100.0
     else:  # Config currently requires at least two hands; kept defensive.
         standard_error = 0.0
     margin = 1.96 * standard_error
     return MatchupReport(
         opponent=opponent_name,
         hands=hands,
+        seed_blocks=len(block_values),
+        ci_method=ci_method,
         pnl_bb=total_pnl,
         bb_per_100=bb_per_100,
         bb_per_100_standard_error=standard_error,
@@ -396,6 +435,14 @@ def _evaluation_copy(policy: EvaluablePolicy) -> EvaluablePolicy:
         # another non-copyable immutable object.  They remain evaluable, but
         # callers should make their random state explicit in that case.
         return policy
+
+
+def _seed_evaluation_policy(policy: EvaluablePolicy, seed: int) -> None:
+    """Reset a bot's private RNG per deal block without touching global RNG."""
+
+    rng = getattr(policy, "_rng", None)
+    if rng is not None and hasattr(rng, "seed"):
+        rng.seed(seed)
 
 
 def _model_action(policy: EvaluablePolicy, observation: Mapping[str, object]) -> tuple[Action, tuple[float, ...], tuple[float, float, float], float]:
