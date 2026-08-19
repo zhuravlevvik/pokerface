@@ -68,6 +68,14 @@ class ExperimentConfig:
             raise ValueError("experiment trials require checkpoint_every_iterations=1")
         if self.training.promotion.enabled or self.training.transition.enabled:
             raise ValueError("experiment trials cannot enable promotion or legacy curriculum transition")
+        if self.training.init_checkpoint is not None:
+            init_path = Path(self.training.init_checkpoint).resolve()
+            if _file_sha256(init_path) != self.training.init_checkpoint_sha256:
+                raise ValueError("experiment init checkpoint SHA-256 does not match training config")
+            if self.training.init_checkpoint_kind == "pretraining":
+                evidence_path = Path(str(self.training.init_evidence_path)).resolve()
+                if _file_sha256(evidence_path) != self.training.init_evidence_sha256:
+                    raise ValueError("experiment pretraining evidence SHA-256 does not match training config")
         if not isinstance(self.evaluation_protocol_path, str) or not self.evaluation_protocol_path.strip():
             raise ValueError("evaluation_protocol_path must be explicit and non-empty")
         protocol_path = Path(self.evaluation_protocol_path).resolve()

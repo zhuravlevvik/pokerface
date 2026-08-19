@@ -12,6 +12,10 @@ Stage 2 запускает PPO от pretraining checkpoint и автоматич
 ```json
 {
   "init_checkpoint": "runs/pretrain-stage-a/checkpoints/latest.pt",
+  "init_checkpoint_sha256": "<sha256>",
+  "init_checkpoint_kind": "pretraining",
+  "init_evidence_path": "runs/pretrain-stage-a/report.json",
+  "init_evidence_sha256": "<sha256>",
   "promotion": {
     "enabled": true,
     "every_iterations": 5,

@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .experiment_runner import load_experiment_config
 from .train_runner import TrainingRunConfig
 from .promotion import PromotionConfig, PromotionEvaluator
 from .train_runner import TrainingRunner
@@ -16,6 +17,7 @@ from .tuning import (
     load_sweep_config,
     materialize_sweep,
     publish_tuning_evaluation,
+    single_experiment_trial,
     write_hu_promotion_protocol,
     write_sweep_config,
 )
@@ -47,14 +49,18 @@ def _parser() -> argparse.ArgumentParser:
     materialize.add_argument("--output-dir", type=Path, required=True)
 
     evaluate = subparsers.add_parser("evaluate", help="run the preregistered HU promotion suite")
-    evaluate.add_argument("--config", type=Path, required=True)
-    evaluate.add_argument("--trial-id", required=True)
+    evaluate_source = evaluate.add_mutually_exclusive_group(required=True)
+    evaluate_source.add_argument("--config", type=Path, help="immutable sweep configuration")
+    evaluate_source.add_argument("--experiment-config", type=Path, help="standalone immutable experiment configuration")
+    evaluate.add_argument("--trial-id", help="trial id within --config; not used with --experiment-config")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--output-dir", type=Path, required=True)
 
     seal = subparsers.add_parser("seal", help="bind fixed-evaluation metrics to a final checkpoint")
-    seal.add_argument("--config", type=Path, required=True)
-    seal.add_argument("--trial-id", required=True)
+    seal_source = seal.add_mutually_exclusive_group(required=True)
+    seal_source.add_argument("--config", type=Path, help="immutable sweep configuration")
+    seal_source.add_argument("--experiment-config", type=Path, help="standalone immutable experiment configuration")
+    seal.add_argument("--trial-id", help="trial id within --config; not used with --experiment-config")
     seal.add_argument("--checkpoint", type=Path, required=True)
     seal.add_argument("--ledger-manifest", type=Path, required=True)
     seal.add_argument("--promotion-report", type=Path, required=True)
@@ -75,6 +81,18 @@ def _trial(config: SweepConfig, trial_id: str):
     return matches[0]
 
 
+def _command_trial(args: argparse.Namespace, parser: argparse.ArgumentParser):
+    """Resolve the one permitted source of evaluation/sealing lineage."""
+
+    if args.config is not None:
+        if not args.trial_id:
+            parser.error("--config requires --trial-id")
+        return _trial(load_sweep_config(args.config), args.trial_id)
+    if args.trial_id is not None:
+        parser.error("--trial-id may only be used with --config")
+    return single_experiment_trial(load_experiment_config(args.experiment_config))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -86,21 +104,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command is None:
         parser.error("choose materialize, seal or compare")
-    config = load_sweep_config(args.config)
     if args.command == "materialize":
+        config = load_sweep_config(args.config)
         trials = materialize_sweep(config, args.output_dir)
         print(f"Materialized {len(trials)} trials under {args.output_dir}")
         return 0
     if args.command == "evaluate":
-        trial = _trial(config, args.trial_id)
+        trial = _command_trial(args, parser)
         protocol = json.loads(Path(trial.evaluation_protocol_path).read_text(encoding="utf-8"))
         promotion_data = protocol.get("promotion_config") if isinstance(protocol, dict) else None
         if not isinstance(promotion_data, dict):
             raise ValueError("evaluation protocol artifact has no promotion_config")
+        promotion_protocol = protocol.get("promotion_protocol")
+        evaluation_run_seed = (
+            promotion_protocol.get("evaluation_run_seed")
+            if isinstance(promotion_protocol, dict)
+            else None
+        )
+        if isinstance(evaluation_run_seed, bool) or not isinstance(evaluation_run_seed, int) or evaluation_run_seed < 0:
+            raise ValueError("evaluation protocol artifact has no valid fixed evaluation_run_seed")
         runner = TrainingRunner.resume(args.checkpoint)
         if runner.config.to_dict() != trial.config.to_dict() or runner.iteration != trial.config.run.iterations:
             raise ValueError("evaluation checkpoint does not match the completed tuning trial")
-        evaluator = PromotionEvaluator(PromotionConfig(**promotion_data), args.output_dir, run_seed=trial.seed)
+        evaluator = PromotionEvaluator(PromotionConfig(**promotion_data), args.output_dir, run_seed=evaluation_run_seed)
         result = evaluator.evaluate_and_promote(
             iteration=runner.iteration,
             candidate_checkpoint=args.checkpoint,
@@ -110,13 +136,14 @@ def main(argv: list[str] | None = None) -> int:
             run_context={
                 "run_config_sha256": trial.run_config_sha256,
                 "evaluation_protocol_sha256": trial.evaluation_protocol_sha256,
+                "evaluation_run_seed": evaluation_run_seed,
             },
         )
         print(f"Evaluation {'accepted' if result.accepted else 'rejected'}: report={result.report_path} archive={evaluator.archive_manifest_path}")
         return 0
     if args.command == "seal":
         evidence = publish_tuning_evaluation(
-            _trial(config, args.trial_id),
+            _command_trial(args, parser),
             args.checkpoint,
             args.ledger_manifest,
             args.promotion_report,
@@ -126,10 +153,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Sealed {evidence.trial_id}: {evidence.evaluation_report_path}")
         return 0
     reports: list[TuningEvidence] = []
+    config = load_sweep_config(args.config)
     trials = {trial.trial_id: trial for trial in config.expand_trials()}
     for path in args.report:
-        import json
-
         payload = json.loads(path.read_text(encoding="utf-8"))
         trial_id = payload.get("trial_id") if isinstance(payload, dict) else None
         if trial_id not in trials:

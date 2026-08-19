@@ -40,11 +40,22 @@ if TORCH_AVAILABLE:
 
 
 CHECKPOINT_VERSION = 1
+INIT_CHECKPOINT_KINDS = {"model_weights_only", "pretraining"}
 
 
 def _require_torch() -> None:
     if not TORCH_AVAILABLE:
         raise RuntimeError("PyTorch is required for training; install the project with `.[rl]`.")
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
+    return value
 
 
 @dataclass(frozen=True)
@@ -136,6 +147,10 @@ class TrainingRunConfig:
     # This is deliberately model-only initialization, never a continuation of
     # optimizer, RNG, league, or rollout state from another run.
     init_checkpoint: str | None = None
+    init_checkpoint_sha256: str | None = None
+    init_checkpoint_kind: str | None = None
+    init_evidence_path: str | None = None
+    init_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.ppo.learning_rate != self.curriculum.base_learning_rate:
@@ -143,8 +158,29 @@ class TrainingRunConfig:
                 "ppo.learning_rate and curriculum.base_learning_rate must match; "
                 "curriculum stage scaling is applied to this shared base"
             )
-        if self.init_checkpoint is not None and (not isinstance(self.init_checkpoint, str) or not self.init_checkpoint.strip()):
-            raise ValueError("init_checkpoint must be a non-empty path string or null")
+        if self.init_checkpoint is None:
+            if any(
+                value is not None
+                for value in (
+                    self.init_checkpoint_sha256,
+                    self.init_checkpoint_kind,
+                    self.init_evidence_path,
+                    self.init_evidence_sha256,
+                )
+            ):
+                raise ValueError("init checkpoint provenance cannot be set without init_checkpoint")
+        else:
+            if not isinstance(self.init_checkpoint, str) or not self.init_checkpoint.strip():
+                raise ValueError("init_checkpoint must be a non-empty path string or null")
+            _require_sha256(self.init_checkpoint_sha256, "init_checkpoint_sha256")
+            if self.init_checkpoint_kind not in INIT_CHECKPOINT_KINDS:
+                raise ValueError(f"init_checkpoint_kind must be one of {sorted(INIT_CHECKPOINT_KINDS)!r}")
+            if self.init_checkpoint_kind == "pretraining":
+                if not isinstance(self.init_evidence_path, str) or not self.init_evidence_path.strip():
+                    raise ValueError("pretraining initialization requires init_evidence_path")
+                _require_sha256(self.init_evidence_sha256, "init_evidence_sha256")
+            elif self.init_evidence_path is not None or self.init_evidence_sha256 is not None:
+                raise ValueError("init evidence is only valid for pretraining initialization")
         if self.promotion.enabled and stage_spec(self.run.stage).player_count != 2:
             raise ValueError("the current promotion protocol can only be enabled for heads-up stages A/B")
         if self.transition.enabled:
@@ -217,6 +253,10 @@ class TrainingRunConfig:
             promotion=PromotionConfig(**promotion_data),
             transition=CurriculumTransitionConfig(**transition_data),
             init_checkpoint=data.get("init_checkpoint"),
+            init_checkpoint_sha256=data.get("init_checkpoint_sha256"),
+            init_checkpoint_kind=data.get("init_checkpoint_kind"),
+            init_evidence_path=data.get("init_evidence_path"),
+            init_evidence_sha256=data.get("init_evidence_sha256"),
         )
 
 
@@ -479,6 +519,38 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         torch.cuda.set_rng_state_all(cuda_state)
 
 
+def _initial_checkpoint_kind(path: Path) -> str:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError("init checkpoint payload must be a mapping")
+    return "pretraining" if "pretraining_checkpoint_version" in payload else "model_weights_only"
+
+
+def _validate_pretraining_init_evidence(
+    checkpoint_path: Path,
+    evidence_path: Path,
+    stage: CurriculumStage,
+) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    provenance = checkpoint.get("provenance") if isinstance(checkpoint, Mapping) else None
+    try:
+        report = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("pretraining init evidence must be a valid JSON report") from error
+    acceptance = report.get("acceptance") if isinstance(report, Mapping) else None
+    if (
+        not isinstance(provenance, Mapping)
+        or not isinstance(report, Mapping)
+        or not isinstance(acceptance, Mapping)
+        or acceptance.get("passed") is not True
+        or report.get("stage") != stage.value
+        or report.get("run_config_sha256") != provenance.get("run_config_sha256")
+        or report.get("corpus_sha256") != provenance.get("corpus_sha256")
+        or report.get("label_protocol") != provenance.get("equity_label_protocol")
+    ):
+        raise ValueError("pretraining init evidence is not an accepted report for this checkpoint/stage")
+
+
 @dataclass(frozen=True)
 class TrainingRunResult:
     iteration: int
@@ -509,7 +581,26 @@ class TrainingRunner:
             raise ValueError("init checkpoint was specified both in config and constructor with different paths")
         self.init_checkpoint = Path(init_checkpoint) if init_checkpoint is not None else (Path(configured_init) if configured_init is not None else None)
         if self.init_checkpoint is not None and config.init_checkpoint is None:
-            config = replace(config, init_checkpoint=str(self.init_checkpoint))
+            checkpoint_kind = _initial_checkpoint_kind(self.init_checkpoint)
+            if checkpoint_kind == "pretraining":
+                raise ValueError("pretraining init checkpoint requires hash-pinned evidence in run config")
+            config = replace(
+                config,
+                init_checkpoint=str(self.init_checkpoint),
+                init_checkpoint_sha256=_file_sha256(self.init_checkpoint),
+                init_checkpoint_kind=checkpoint_kind,
+            )
+        if self.init_checkpoint is not None:
+            if _file_sha256(self.init_checkpoint) != config.init_checkpoint_sha256:
+                raise ValueError("init checkpoint SHA-256 does not match immutable run config")
+            actual_kind = _initial_checkpoint_kind(self.init_checkpoint)
+            if actual_kind != config.init_checkpoint_kind:
+                raise ValueError("init checkpoint payload kind does not match immutable run config")
+            if config.init_checkpoint_kind == "pretraining":
+                evidence_path = Path(str(config.init_evidence_path))
+                if _file_sha256(evidence_path) != config.init_evidence_sha256:
+                    raise ValueError("pretraining init evidence SHA-256 does not match immutable run config")
+                _validate_pretraining_init_evidence(self.init_checkpoint, evidence_path, config.run.stage)
         self.config = config
         self._seed_everything(config.run.seed)
         self.scheduler = StageScheduler(config.curriculum, initial_stage=config.run.stage)
@@ -554,9 +645,11 @@ class TrainingRunner:
         self.manifest: dict[str, Any] = {"version": 1, "checkpoints": []}
         if self.init_checkpoint is not None:
             self.manifest["initialization"] = {
-                "kind": "model_weights_only",
+                "kind": config.init_checkpoint_kind,
                 "checkpoint": str(self.init_checkpoint),
-                "checkpoint_sha256": _file_sha256(self.init_checkpoint),
+                "checkpoint_sha256": config.init_checkpoint_sha256,
+                "evidence_path": config.init_evidence_path,
+                "evidence_sha256": config.init_evidence_sha256,
                 "metadata": self.model.checkpoint_metadata(),
             }
         if self.promotion_evaluator is not None:
@@ -823,6 +916,19 @@ class TrainingRunner:
         if not isinstance(manifest, Mapping):
             raise ValueError("checkpoint has invalid manifest")
         instance.manifest = dict(manifest)
+        initialization = instance.manifest.get("initialization")
+        if config.init_checkpoint is None:
+            if initialization is not None:
+                raise ValueError("checkpoint manifest has unexpected initialization provenance")
+        elif (
+            not isinstance(initialization, Mapping)
+            or initialization.get("kind") != config.init_checkpoint_kind
+            or initialization.get("checkpoint") != config.init_checkpoint
+            or initialization.get("checkpoint_sha256") != config.init_checkpoint_sha256
+            or initialization.get("evidence_path") != config.init_evidence_path
+            or initialization.get("evidence_sha256") != config.init_evidence_sha256
+        ):
+            raise ValueError("checkpoint manifest initialization provenance does not match run config")
         if instance.promotion_evaluator is not None:
             section = instance.manifest.setdefault(
                 "promotion",

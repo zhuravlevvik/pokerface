@@ -62,18 +62,21 @@ league, поэтому следующий rollout продолжает исхо�
 
 ## Новый PPO-run из warm-start checkpoint
 
-Equity/pretraining checkpoint (или обычный model checkpoint) можно использовать
-только как начальные веса для **нового** PPO-run:
+Обычный model checkpoint можно использовать только как начальные веса для
+**нового** PPO-run; CLI вычислит и запишет его SHA в full run config:
 
 ```bash
 .venv/bin/python -m poker.train_cli \
   --config configs/hu-stage-a.json \
   --run-dir runs/hu-stage-a-warm \
-  --init-checkpoint runs/pretrain-stage-a/checkpoints/latest.pt
+  --init-checkpoint runs/model-stage-a/checkpoint.pt
 ```
 
-Альтернатива — задать `"init_checkpoint": "..."` на верхнем уровне run
-config. Архитектура и versioned model metadata обязаны точно совпадать с
+Для pretraining checkpoint используется только явно закреплённый вариант в
+run config: `init_checkpoint`,
+`init_checkpoint_sha256` и `init_checkpoint_kind`. Для kind `pretraining`
+обязательны также hash-pinned `init_evidence_path` и
+`init_evidence_sha256`. Архитектура и versioned model metadata обязаны точно совпадать с
 `model` в новом config. Инициализация переносит исключительно model weights:
 optimizer, RNG, league, счётчики и manifest создаются заново. `--resume` и
 `--init-checkpoint` взаимоисключающие; для продолжения полного PPO-run нужен
@@ -151,3 +154,6 @@ invocation-only `--iterations` обычного train CLI. Experiment config ф�
 детерминированную матрицу отдельных trials и сравнивает только завершённые
 hash-bound evaluation reports. Полный контракт и команды приведены в
 [18_experiment_ledger_and_tuning.md](18_experiment_ledger_and_tuning.md).
+Для реального выбора параметров поверх trials используйте multi-seed campaign
+из [19_stage_a_multiseed_campaign.md](19_stage_a_multiseed_campaign.md); она
+фиксирует общий evaluation RNG и не позволяет выбрать единственный удачный seed.

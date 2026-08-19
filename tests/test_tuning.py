@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from poker.curriculum import CurriculumConfig, CurriculumStage
-from poker.experiment_runner import ExperimentRunner
+from poker.experiment_runner import ExperimentRunner, write_experiment_config
 from poker.experiments import ExperimentConfig
 from poker.promotion import PromotionConfig, PromotionEvaluator
 from poker.model import ModelConfig
@@ -21,6 +21,7 @@ from poker.tuning import (
     compare_tuning_evidence,
     materialize_sweep,
     publish_tuning_evaluation,
+    single_experiment_trial,
     write_hu_promotion_protocol,
     write_sweep_config,
 )
@@ -95,7 +96,7 @@ def _evidence(tmp_path, spec, promotion: PromotionConfig) -> TuningEvidence:
     experiment_runner = ExperimentRunner(experiment, tmp_path / "experiments" / spec.trial_id)
     result = experiment_runner.run(install_signal_handlers=False)
     assert result.status == "completed" and result.checkpoint_path is not None
-    evaluator = PromotionEvaluator(promotion, tmp_path / "promotion" / spec.trial_id, run_seed=spec.seed)
+    evaluator = PromotionEvaluator(promotion, tmp_path / "promotion" / spec.trial_id, run_seed=0)
     evaluated = evaluator.evaluate_and_promote(
         iteration=result.iteration,
         candidate_checkpoint=result.checkpoint_path,
@@ -105,6 +106,7 @@ def _evidence(tmp_path, spec, promotion: PromotionConfig) -> TuningEvidence:
         run_context={
             "run_config_sha256": spec.run_config_sha256,
             "evaluation_protocol_sha256": spec.evaluation_protocol_sha256,
+            "evaluation_run_seed": 0,
         },
     )
     return publish_tuning_evaluation(
@@ -291,14 +293,18 @@ def test_tuning_cli_materializes_seals_and_compares_one_trial(tmp_path) -> None:
     experiment_runner = ExperimentRunner(experiment, tmp_path / "experiment")
     completed = experiment_runner.run(install_signal_handlers=False)
     assert completed.checkpoint_path is not None
-    evaluator = PromotionEvaluator(promotion, tmp_path / "promotion", run_seed=spec.seed)
+    evaluator = PromotionEvaluator(promotion, tmp_path / "promotion", run_seed=0)
     evaluated = evaluator.evaluate_and_promote(
         iteration=1,
         candidate_checkpoint=completed.checkpoint_path,
         league=experiment_runner.trainer.league,
         stage=spec.config.run.stage,
         champion_score=None,
-        run_context={"run_config_sha256": spec.run_config_sha256, "evaluation_protocol_sha256": spec.evaluation_protocol_sha256},
+        run_context={
+            "run_config_sha256": spec.run_config_sha256,
+            "evaluation_protocol_sha256": spec.evaluation_protocol_sha256,
+            "evaluation_run_seed": 0,
+        },
     )
     report = tmp_path / "evaluation.json"
     assert tuning_main([
@@ -314,3 +320,64 @@ def test_tuning_cli_materializes_seals_and_compares_one_trial(tmp_path) -> None:
         "compare", "--config", str(config_path), "--report", str(report), "--output", str(comparison),
     ]) == 0
     assert json.loads(comparison.read_text(encoding="utf-8"))["winner_trial_id"] == spec.trial_id
+
+
+def test_tuning_cli_evaluates_and_seals_standalone_experiment(tmp_path) -> None:
+    sweep, _ = _real_sweep(tmp_path, grid={}, seeds=(5,), max_iterations=1)
+    sweep_spec = sweep.expand_trials()[0]
+    experiment = ExperimentConfig(
+        name="standalone-stage-a",
+        training=sweep_spec.config,
+        max_iterations=1,
+        evaluation_protocol_path=sweep_spec.evaluation_protocol_path,
+        evaluation_protocol_sha256=sweep_spec.evaluation_protocol_sha256,
+        code_revision=sweep_spec.code_revision,
+    )
+    experiment_config = write_experiment_config(experiment, tmp_path / "experiment.json")
+    trial = single_experiment_trial(experiment)
+    assert trial.trial_id == experiment.name
+
+    experiment_runner = ExperimentRunner(experiment, tmp_path / "experiment")
+    completed = experiment_runner.run(install_signal_handlers=False)
+    assert completed.status == "completed" and completed.checkpoint_path is not None
+
+    evaluation_directory = tmp_path / "promotion"
+    assert tuning_main([
+        "evaluate", "--experiment-config", str(experiment_config),
+        "--checkpoint", str(completed.checkpoint_path),
+        "--output-dir", str(evaluation_directory),
+    ]) == 0
+    promotion_report = next((evaluation_directory / "evaluations").glob("evaluation_*.json"))
+    sealed_report = tmp_path / "sealed.json"
+    assert tuning_main([
+        "seal", "--experiment-config", str(experiment_config),
+        "--checkpoint", str(completed.checkpoint_path),
+        "--ledger-manifest", str(experiment_runner.ledger.manifest_path),
+        "--promotion-report", str(promotion_report),
+        "--promotion-archive-manifest", str(evaluation_directory / "archive" / "manifest.json"),
+        "--report", str(sealed_report),
+    ]) == 0
+    evidence = TuningEvidence.from_artifacts(trial, completed.checkpoint_path, sealed_report)
+    assert evidence.trial_id == experiment.name
+
+
+def test_tuning_cli_rejects_mixed_or_incomplete_trial_sources(tmp_path) -> None:
+    sweep, _ = _real_sweep(tmp_path, grid={}, seeds=(5,), max_iterations=1)
+    sweep_config = write_sweep_config(sweep, tmp_path / "sweep.json")
+    spec = sweep.expand_trials()[0]
+    experiment = ExperimentConfig(
+        name="standalone-stage-a",
+        training=spec.config,
+        max_iterations=1,
+        evaluation_protocol_path=spec.evaluation_protocol_path,
+        evaluation_protocol_sha256=spec.evaluation_protocol_sha256,
+        code_revision=spec.code_revision,
+    )
+    experiment_config = write_experiment_config(experiment, tmp_path / "experiment.json")
+    common = ["--checkpoint", str(tmp_path / "checkpoint.pt"), "--output-dir", str(tmp_path / "promotion")]
+    with pytest.raises(SystemExit, match="2"):
+        tuning_main(["evaluate", "--config", str(sweep_config), "--experiment-config", str(experiment_config), *common])
+    with pytest.raises(SystemExit, match="2"):
+        tuning_main(["evaluate", "--config", str(sweep_config), *common])
+    with pytest.raises(SystemExit, match="2"):
+        tuning_main(["evaluate", "--experiment-config", str(experiment_config), "--trial-id", spec.trial_id, *common])

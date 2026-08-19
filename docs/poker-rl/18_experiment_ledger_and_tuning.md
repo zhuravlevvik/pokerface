@@ -115,6 +115,12 @@ report SHA, protocol SHA и metric binding. Прошедшие trials сорти
 нижней границе CI, затем по expected-showdown-share ECE и стабильному id.
 Failed trial остаётся в отчёте без rank.
 
+Это ранжирование отдельных trials оставлено как диагностический primitive. Для
+решения о выборе гиперпараметров используйте multi-seed campaign: она требует
+полную матрицу seed и строит cross-seed CI отдельно для каждого baseline.
+Операторская цепочка `run → evaluate-seal → aggregate → verify` описана в
+[19_stage_a_multiseed_campaign.md](19_stage_a_multiseed_campaign.md).
+
 ## Release registry
 
 Только прошедший sealed report можно добавить в append-only registry. Все SHA
@@ -142,6 +148,11 @@ artifact, promotion report/archive, derived CI/ECE и отсутствие illeg
 actions. Model-only checkpoint, незавершённый trial, rejected report либо
 изменённый lineage artifact отклоняются. Дополнительные pretraining/curriculum
 артефакты можно закрепить повторяемым `--extra KIND=PATH=SHA256`.
+
+Для tuning sweep отдельный seed-checkpoint не следует выпускать только потому,
+что он занял первое место в single-trial comparison. Сначала campaign выбирает
+вариант по нескольким seed; затем отдельный заранее зарегистрированный
+canonical run этого варианта создаёт release candidate.
 
 Модель доверия здесь — operator-controlled local workspace. `code_revision`
 является явно предоставленной внешней аттестацией commit/build, а не цифровой
