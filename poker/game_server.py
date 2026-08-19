@@ -15,9 +15,11 @@ from .inference import (
     IdentifiedDecisionService,
     InferenceResponse,
     PolicyIdentity,
+    ScalarMetric,
     baseline_policy,
     baseline_policy_catalog,
     decision_identity,
+    validate_scalar_metric,
     validate_response,
 )
 from .observation import observation_for
@@ -40,13 +42,24 @@ def _validate_viewer(mode: str, hero_seat: int, state: HandState) -> ViewerMode:
 
 @dataclass(frozen=True)
 class EquityPoint:
+    """One scalar point with an explicit meaning suitable for browser replay."""
+
     street: str
     seat: int
-    equity: float
+    metric: str
+    value: float
+    protocol: str
     action_index: int
 
     def as_dict(self) -> dict[str, object]:
-        return {"street": self.street, "seat": self.seat, "equity": self.equity, "action_index": self.action_index}
+        return {
+            "street": self.street,
+            "seat": self.seat,
+            "metric": self.metric,
+            "value": self.value,
+            "protocol": self.protocol,
+            "action_index": self.action_index,
+        }
 
 
 @dataclass
@@ -120,14 +133,17 @@ class ObservableHand:
             validate_response(response, observation["legal_actions"])
             policy = self.policy_for_seat(seat)
             visible_analysis = response.as_dict() if mode == "spectator" or seat == hero_seat else None
-            self.equity_points.append(
-                EquityPoint(
-                    street=self.state.street.value,
-                    seat=seat,
-                    equity=response.equity["total"],
-                    action_index=len(self.state.action_history),
+            if response.scalar_metric is not None:
+                self.equity_points.append(
+                    EquityPoint(
+                        street=self.state.street.value,
+                        seat=seat,
+                        metric=response.scalar_metric.name,
+                        value=response.scalar_metric.value,
+                        protocol=response.scalar_metric.protocol,
+                        action_index=len(self.state.action_history),
+                    )
                 )
-            )
             self.analyses.append({"seat": seat, "policy": policy.as_dict(), "analysis": visible_analysis})
             self.state.step(Action(response.action))
             yield {
@@ -367,9 +383,22 @@ class GameServer:
         for item in raw_points:
             if not isinstance(item, dict):
                 raise ValueError("replay equity point must be an object")
-            point = EquityPoint(
-                street=str(item["street"]), seat=int(item["seat"]), equity=float(item["equity"]), action_index=int(item["action_index"])
-            )
+            if {"metric", "value", "protocol"} <= set(item):
+                point = EquityPoint(
+                    street=str(item["street"]),
+                    seat=int(item["seat"]),
+                    metric=str(item["metric"]),
+                    value=float(item["value"]),
+                    protocol=str(item["protocol"]),
+                    action_index=int(item["action_index"]),
+                )
+                validate_scalar_metric(ScalarMetric(point.metric, point.value, point.protocol))
+            else:
+                # Old points carry no durable policy/protocol provenance.  A
+                # value may be a checkpoint's HU convention or merely a bot's
+                # heuristic strength, so silently naming it would fabricate
+                # semantics even at a two-player table.
+                raise ValueError("replay equity point lacks a typed scalar metric")
             points_by_action.setdefault(point.action_index, []).append(point)
         events: list[dict[str, object]] = [{"type": "hand_started", "table": observable.table_view(mode=mode, hero_seat=hero_seat)}]
         for index, record in enumerate(engine_replay["actions"]):
@@ -377,7 +406,19 @@ class GameServer:
                 raise ValueError("replay action order does not match the hand state")
             observable.equity_points.extend(points_by_action.get(index, []))
             state.step(record["action"])
-            analysis = raw_analyses[index].get("analysis") if index < len(raw_analyses) and isinstance(raw_analyses[index], dict) else None
+            stored_analysis = (
+                raw_analyses[index].get("analysis")
+                if index < len(raw_analyses) and isinstance(raw_analyses[index], dict)
+                else None
+            )
+            analysis = stored_analysis if mode == "spectator" or record["seat"] == hero_seat else None
+            observable.analyses.append(
+                {
+                    "seat": record["seat"],
+                    "policy": observable.policy_for_seat(record["seat"]).as_dict(),
+                    "analysis": analysis,
+                }
+            )
             events.append(
                 {
                     "type": "action",
@@ -388,5 +429,14 @@ class GameServer:
                     "table": observable.table_view(mode=mode, hero_seat=hero_seat),
                 }
             )
-        events.append({"type": "hand_complete", "table": observable.table_view(mode=mode, hero_seat=hero_seat), "replay": replay})
+        events.append(
+            {
+                "type": "hand_complete",
+                "table": observable.table_view(mode=mode, hero_seat=hero_seat),
+                "replay": observable.browser_replay(
+                    reveal_hole_cards=mode == "spectator",
+                    hero_seat=hero_seat,
+                ),
+            }
+        )
         return events

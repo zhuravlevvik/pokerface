@@ -83,6 +83,8 @@ def test_pretraining_hook_exports_safe_labeled_traces() -> None:
     example = dataset[0]
     assert example.stage is CurriculumStage.A_HEADS_UP_STARTER
     assert sum(example.equity_target) == pytest.approx(1.0)
+    assert example.expected_showdown_share_target is not None
+    assert 0.0 <= example.expected_showdown_share_target <= 1.0
     assert all("hole_cards" not in player for player in example.observation["players"])
     metrics = dataset.equity_quality([example.equity_target for _ in dataset])
     assert metrics["samples"] == len(dataset)

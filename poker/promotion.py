@@ -22,7 +22,7 @@ if TORCH_AVAILABLE:
     import torch
 
 
-PROMOTION_REPORT_VERSION = 1
+PROMOTION_REPORT_VERSION = 2
 PROMOTION_BASELINES = ("rule", "tight", "aggro", "calling_station", "random")
 
 
@@ -225,6 +225,8 @@ class PromotionEvaluator:
         report_path = self.report_directory / f"evaluation_{candidate_id}.json"
         protocol = {
             "stage": stage.value,
+            "outcome_protocol": "fixed_deal_virtual_showdown_outcome_v1",
+            "scalar_metric_protocol": "active_hands_expected_showdown_share_v1",
             "player_count": spec.player_count,
             "starting_stack": spec.starting_stack_chips(),
             "allowed_raise_actions": [action.value for action in sorted(spec.allowed_raise_actions, key=lambda action: action.value)],
@@ -436,9 +438,12 @@ class PromotionEvaluator:
             for item in baselines
         ):
             reasons.append("a baseline matchup confidence interval is wider than the configured ceiling")
-        equity = [item.equity for item in baselines]
-        if any(item is None or item.expected_calibration_error > self.config.maximum_equity_ece for item in equity):
-            reasons.append("heads-up equity calibration exceeds the configured ECE ceiling")
+        showdown_share = [item.expected_showdown_share for item in baselines]
+        if any(
+            item is None or item.expected_calibration_error > self.config.maximum_equity_ece
+            for item in showdown_share
+        ):
+            reasons.append("heads-up expected-showdown-share calibration exceeds the configured ECE ceiling")
         if any(item.model_diagnostics.illegal_action_count for item in suite.matchups):
             reasons.append("candidate selected an illegal or masked action")
         if any(not item.legal or not item.finite for item in suite.sanity_checks):

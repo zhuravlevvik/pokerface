@@ -65,9 +65,14 @@ def test_run_writes_restricted_corpus_report_resumable_checkpoint_and_inference_
     assert result.report_path.exists() and runner.corpus_path.exists()
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
     assert report["target_semantics"].startswith("fixed-deal")
-    assert report["scalar_equity_semantics"].endswith("(heads-up only)")
-    assert {"logloss", "brier_score", "expected_calibration_error"} <= set(report["aggregate"]["model"])
-    assert {"mae", "rmse"} == set(report["aggregate"]["heads_up_scalar"])
+    assert report["scalar_metric"]["name"] == "expected_showdown_share"
+    assert report["scalar_metric"]["protocol"] == "active_hands_expected_showdown_share_v1"
+    assert {"logloss", "brier_score", "expected_calibration_error"} <= set(
+        report["aggregate"]["outcome_model"]
+    )
+    assert {"mean_absolute_error", "root_mean_squared_error", "expected_calibration_error"} <= set(
+        report["aggregate"]["expected_showdown_share"]
+    )
     assert report["strata"]
     payload = torch.load(runner.latest_path, map_location="cpu", weights_only=True)
     assert payload["provenance"]["corpus_sha256"] == report["corpus_sha256"]

@@ -3,7 +3,9 @@
 The policy observation deliberately omits opponent hole cards and undealt
 cards.  This module may use them *only* inside :class:`EquitySnapshot` to
 construct supervision for an auxiliary head.  Its public result is a soft
-``[win, tie, loss]`` target and is safe to attach to a training record.
+``[win, tie, loss]`` target and an expected **showdown** share target.  The
+latter is the hero's fractional share among active hands at a virtual
+showdown; it is intentionally not a final-pot or side-pot payout label.
 """
 
 from __future__ import annotations
@@ -62,13 +64,24 @@ class EquitySnapshot:
 
 @dataclass(frozen=True)
 class EquityTarget:
-    """A model-safe soft target ordered as ``[win, tie, loss]``."""
+    """Outcome probabilities plus correct multiway expected showdown share.
+
+    For each virtual runout the hero receives zero when losing, one when the
+    sole best hand, and ``1 / number_of_best_hands`` when tied.  Averaging that
+    value yields ``expected_showdown_share``.  This excludes folded players,
+    side pots and the actual continuation of the hand by construction.
+
+    ``None`` is accepted only as a legacy constructor convenience and derives
+    the heads-up formula.  Labels emitted by :func:`generate_equity_target`
+    always populate the explicit, multiway-correct value.
+    """
 
     win: float
     tie: float
     loss: float
     samples: int
     exact: bool
+    expected_showdown_share: float | None = None
 
     def __post_init__(self) -> None:
         probabilities = self.probabilities
@@ -78,6 +91,12 @@ class EquityTarget:
             raise ValueError("equity probabilities must be finite and non-negative")
         if abs(sum(probabilities) - 1.0) > 1e-8:
             raise ValueError("equity probabilities must sum to one")
+        share = self.expected_showdown_share
+        if share is None:
+            object.__setattr__(self, "expected_showdown_share", self.win + 0.5 * self.tie)
+            share = self.expected_showdown_share
+        if not isinstance(share, (int, float)) or not isfinite(float(share)) or not 0.0 <= float(share) <= 1.0:
+            raise ValueError("expected_showdown_share must be finite and in [0, 1]")
 
     @property
     def probabilities(self) -> tuple[float, float, float]:
@@ -85,9 +104,16 @@ class EquityTarget:
 
     @property
     def equity(self) -> float:
-        """Displayed showdown equity under the fixed product semantics."""
+        """Legacy heads-up display scalar, not a multiway pot-share metric."""
 
         return self.win + 0.5 * self.tie
+
+    @property
+    def expected_share(self) -> float:
+        """Compatibility alias for :attr:`expected_showdown_share`."""
+
+        assert self.expected_showdown_share is not None
+        return float(self.expected_showdown_share)
 
     def as_list(self) -> list[float]:
         return list(self.probabilities)
@@ -112,7 +138,12 @@ class EquityCalibrationBin:
 
 @dataclass(frozen=True)
 class EquityMetrics:
-    """Holdout quality report for the equity head."""
+    """Categorical outcome diagnostics.
+
+    The ECE member retains the legacy ``win + 0.5 * tie`` reduction and is
+    therefore suitable only for heads-up compatibility reports.  Multiway
+    gates must use :class:`ExpectedShowdownShareMetrics`.
+    """
 
     samples: int
     logloss: float
@@ -125,6 +156,40 @@ class EquityMetrics:
             "samples": self.samples,
             "logloss": self.logloss,
             "brier_score": self.brier_score,
+            "expected_calibration_error": self.expected_calibration_error,
+            "calibration": [
+                {
+                    "lower": item.lower,
+                    "upper": item.upper,
+                    "count": item.count,
+                    "mean_prediction": item.mean_prediction,
+                    "mean_target": item.mean_target,
+                    "gap": item.gap,
+                }
+                for item in self.calibration
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class ExpectedShowdownShareMetrics:
+    """Proper scalar diagnostics for expected showdown-share predictions."""
+
+    samples: int
+    logloss: float
+    brier_score: float
+    mean_absolute_error: float
+    root_mean_squared_error: float
+    expected_calibration_error: float
+    calibration: tuple[EquityCalibrationBin, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "samples": self.samples,
+            "logloss": self.logloss,
+            "brier_score": self.brier_score,
+            "mean_absolute_error": self.mean_absolute_error,
+            "root_mean_squared_error": self.root_mean_squared_error,
             "expected_calibration_error": self.expected_calibration_error,
             "calibration": [
                 {
@@ -180,19 +245,19 @@ def generate_equity_target(snapshot: EquitySnapshot, *, samples: int = 16, seed:
         raise ValueError("samples must be positive")
     runout_count = comb(len(snapshot.remaining_deck), snapshot.cards_to_come)
     if snapshot.cards_to_come == 0:
-        outcomes = [_showdown_outcome(snapshot, ())]
+        outcomes = [_showdown_result(snapshot, ())]
         exact = True
     elif samples >= runout_count:
-        outcomes = [_showdown_outcome(snapshot, runout) for runout in combinations(snapshot.remaining_deck, snapshot.cards_to_come)]
+        outcomes = [_showdown_result(snapshot, runout) for runout in combinations(snapshot.remaining_deck, snapshot.cards_to_come)]
         exact = True
     else:
         randomizer = Random(_stable_seed(snapshot) if seed is None else seed)
         outcomes = [
-            _showdown_outcome(snapshot, tuple(randomizer.sample(snapshot.remaining_deck, snapshot.cards_to_come)))
+            _showdown_result(snapshot, tuple(randomizer.sample(snapshot.remaining_deck, snapshot.cards_to_come)))
             for _ in range(samples)
         ]
         exact = False
-    counts = {outcome: outcomes.count(outcome) for outcome in EQUITY_OUTCOMES}
+    counts = {outcome: sum(result[0] == outcome for result in outcomes) for outcome in EQUITY_OUTCOMES}
     total = len(outcomes)
     return EquityTarget(
         win=counts["win"] / total,
@@ -200,6 +265,7 @@ def generate_equity_target(snapshot: EquitySnapshot, *, samples: int = 16, seed:
         loss=counts["loss"] / total,
         samples=total,
         exact=exact,
+        expected_showdown_share=sum(result[1] for result in outcomes) / total,
     )
 
 
@@ -232,7 +298,7 @@ def equity_cross_entropy(logits, targets, *, reduction: str = "mean"):
 
 
 def equity_metrics(predictions: Iterable[Sequence[float] | EquityTarget], targets: Iterable[Sequence[float] | EquityTarget], *, bins: int = 10) -> EquityMetrics:
-    """Calculate soft logloss, multiclass Brier score and equity calibration."""
+    """Calculate outcome logloss/Brier and the legacy heads-up scalar ECE."""
 
     if bins < 1:
         raise ValueError("bins must be positive")
@@ -272,13 +338,82 @@ def equity_metrics(predictions: Iterable[Sequence[float] | EquityTarget], target
     )
 
 
-def _showdown_outcome(snapshot: EquitySnapshot, runout: tuple[Card, ...]) -> str:
+def expected_showdown_share_binary_cross_entropy(logits, targets, *, reduction: str = "mean"):
+    """Proper soft Bernoulli loss for scalar expected showdown share.
+
+    A fractional share is a valid soft target in ``[0, 1]``.  This loss is
+    independent of outcome CE so multiway share learning does not force the
+    three-class head to encode the number of co-winners.
+    """
+
+    try:
+        import torch
+        import torch.nn.functional as functional
+    except ModuleNotFoundError as error:  # pragma: no cover - optional path.
+        raise RuntimeError("expected_showdown_share_binary_cross_entropy requires PyTorch; install with `.[rl]`.") from error
+    if logits.shape != targets.shape:
+        raise ValueError("logits and targets must have the same shape")
+    if not torch.isfinite(targets).all() or bool(((targets < 0) | (targets > 1)).any()):
+        raise ValueError("expected showdown-share targets must be finite and in [0, 1]")
+    if reduction not in {"none", "mean", "sum"}:
+        raise ValueError("reduction must be one of: none, mean, sum")
+    return functional.binary_cross_entropy_with_logits(logits, targets, reduction=reduction)
+
+
+def expected_showdown_share_metrics(
+    predictions: Iterable[float | EquityTarget], targets: Iterable[float | EquityTarget], *, bins: int = 10
+) -> ExpectedShowdownShareMetrics:
+    """Calculate proper scalar calibration for active-hand showdown share."""
+
+    if bins < 1:
+        raise ValueError("bins must be positive")
+    prediction_rows = [_share_value(item, "prediction") for item in predictions]
+    target_rows = [_share_value(item, "target") for item in targets]
+    if not prediction_rows:
+        raise ValueError("predictions must not be empty")
+    if len(prediction_rows) != len(target_rows):
+        raise ValueError("predictions and targets must have the same length")
+    epsilon = 1e-12
+    logloss = sum(
+        -(target * log(max(prediction, epsilon)) + (1.0 - target) * log(max(1.0 - prediction, epsilon)))
+        for prediction, target in zip(prediction_rows, target_rows, strict=True)
+    ) / len(prediction_rows)
+    squared_errors = [(prediction - target) ** 2 for prediction, target in zip(prediction_rows, target_rows, strict=True)]
+    brier = sum(squared_errors) / len(squared_errors)
+    mae = sum(abs(prediction - target) for prediction, target in zip(prediction_rows, target_rows, strict=True)) / len(prediction_rows)
+    grouped: list[list[tuple[float, float]]] = [[] for _ in range(bins)]
+    for prediction, target in zip(prediction_rows, target_rows, strict=True):
+        grouped[min(int(prediction * bins), bins - 1)].append((prediction, target))
+    calibration: list[EquityCalibrationBin] = []
+    ece = 0.0
+    for index, values in enumerate(grouped):
+        lower, upper = index / bins, (index + 1) / bins
+        if values:
+            predicted_mean = sum(item[0] for item in values) / len(values)
+            target_mean = sum(item[1] for item in values) / len(values)
+            ece += len(values) / len(prediction_rows) * abs(predicted_mean - target_mean)
+        else:
+            predicted_mean = target_mean = None
+        calibration.append(EquityCalibrationBin(lower, upper, len(values), predicted_mean, target_mean))
+    return ExpectedShowdownShareMetrics(
+        samples=len(prediction_rows),
+        logloss=logloss,
+        brier_score=brier,
+        mean_absolute_error=mae,
+        root_mean_squared_error=(brier**0.5),
+        expected_calibration_error=ece,
+        calibration=tuple(calibration),
+    )
+
+
+def _showdown_result(snapshot: EquitySnapshot, runout: tuple[Card, ...]) -> tuple[str, float]:
     hero_rank = evaluate((*snapshot.hero_hole_cards, *snapshot.board, *runout))
     opponent_ranks = [evaluate((*cards, *snapshot.board, *runout)) for cards in snapshot.opponent_hole_cards]
     best = max(hero_rank, *opponent_ranks)
     if hero_rank != best:
-        return "loss"
-    return "win" if all(rank != hero_rank for rank in opponent_ranks) else "tie"
+        return "loss", 0.0
+    winner_count = sum(rank == best for rank in (hero_rank, *opponent_ranks))
+    return ("win" if winner_count == 1 else "tie"), 1.0 / winner_count
 
 
 def _stable_seed(snapshot: EquitySnapshot) -> int:
@@ -294,3 +429,10 @@ def _probabilities(value: Sequence[float] | EquityTarget, name: str) -> tuple[fl
     if any(not isfinite(item) or item < 0.0 for item in normalized) or abs(sum(normalized) - 1.0) > 1e-6:
         raise ValueError(f"{name} must be a finite probability distribution")
     return normalized  # type: ignore[return-value]
+
+
+def _share_value(value: float | EquityTarget, name: str) -> float:
+    raw = value.expected_showdown_share if isinstance(value, EquityTarget) else value
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not isfinite(float(raw)) or not 0.0 <= float(raw) <= 1.0:
+        raise ValueError(f"{name} expected showdown share must be finite and in [0, 1]")
+    return float(raw)

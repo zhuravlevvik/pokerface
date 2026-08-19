@@ -9,6 +9,7 @@ import pytest
 import poker.train_runner as train_runner_module
 
 from poker.curriculum import CurriculumConfig, CurriculumStage
+from poker.curriculum_transition import CurriculumTransitionConfig
 from poker.game_state import HandState
 from poker.league import default_league
 from poker.model import ModelConfig, TORCH_AVAILABLE, PokerAgentModel
@@ -70,6 +71,41 @@ def _with_promotion(config: TrainingRunConfig, promotion: PromotionConfig) -> Tr
         curriculum=config.curriculum,
         league=config.league,
         promotion=promotion,
+        transition=config.transition,
+        init_checkpoint=config.init_checkpoint,
+    )
+
+
+def _with_transition(config: TrainingRunConfig, reference_checkpoint, *, accept: bool = True) -> TrainingRunConfig:
+    curriculum = CurriculumConfig(
+        base_learning_rate=config.curriculum.base_learning_rate,
+        min_baseline_win_rate_bb_per_100=-1e9 if accept else 1e9,
+        max_equity_calibration_error=1.0,
+        require_transfer_beats_scratch=False,
+        require_previous_checkpoint_win=True,
+    )
+    transition = CurriculumTransitionConfig(
+        enabled=True,
+        every_iterations=1,
+        hands_per_opponent=2,
+        equity_samples=1,
+        calibration_bins=4,
+        baseline_bots=("rule",),
+        minimum_baseline_ci95_low=-1e9,
+        maximum_baseline_ci95_half_width=1e9,
+        minimum_prior_ci95_low=-1e9,
+        reference_checkpoint=str(reference_checkpoint),
+        reference_checkpoint_sha256=train_runner_module._file_sha256(reference_checkpoint),
+        curriculum=curriculum,
+    )
+    return TrainingRunConfig(
+        run=config.run,
+        model=config.model,
+        ppo=config.ppo,
+        curriculum=curriculum,
+        league=config.league,
+        promotion=config.promotion,
+        transition=transition,
         init_checkpoint=config.init_checkpoint,
     )
 
@@ -340,6 +376,172 @@ def test_stop_requested_during_promotion_does_not_run_an_extra_update(tmp_path, 
 
     assert result.interrupted
     assert result.iteration == updates == 1
+
+
+def test_runner_transitions_a_to_b_resets_optimizer_and_resumes_target_stage(tmp_path) -> None:
+    base = _config(iterations=1)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    config = _with_transition(base, reference)
+    assert TrainingRunConfig.from_dict(config.to_dict()) == config
+    runner = TrainingRunner(config, tmp_path / "transitioned")
+
+    result = runner.run(install_signal_handlers=False)
+
+    assert not result.interrupted
+    assert runner.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+    assert runner.trainer.optimizer.param_groups[0]["lr"] == pytest.approx(config.curriculum.learning_rate_for("B"))
+    assert not runner.trainer.optimizer.state
+    assert runner.last_transition_evaluation_iteration == 1
+    assert runner.pending_transition_iteration is None
+    assert runner.transition_evaluator is not None
+    accepted = runner.transition_evaluator.last_accepted_decision
+    assert accepted is not None
+    transfer = accepted["transfer_checkpoint"]
+    assert transfer is not None and PokerAgentModel.load_checkpoint(transfer).checkpoint_metadata() == runner.model.checkpoint_metadata()
+    payload = torch.load(runner.latest_path, map_location="cpu", weights_only=True)
+    assert payload["curriculum"]["stage"] == "B"
+    assert payload["curriculum_transition_state"]["last_evaluation_iteration"] == 1
+    restored = TrainingRunner.resume(runner.latest_path)
+    assert restored.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+    assert restored.pending_transition_iteration is None
+    assert not restored.trainer.optimizer.state
+
+
+def test_rejected_curriculum_transition_keeps_stage_optimizer_and_rng_stream(tmp_path) -> None:
+    base = _config(iterations=2)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    rejected_config = _with_transition(base, reference, accept=False)
+    rejected = TrainingRunner(rejected_config, tmp_path / "rejected")
+    rejected.run(install_signal_handlers=False)
+
+    assert rejected.scheduler.stage is CurriculumStage.A_HEADS_UP_STARTER
+    assert rejected.trainer.optimizer.state
+    assert rejected.last_transition_evaluation_iteration == 2
+    assert rejected.transition_evaluator is not None
+    assert rejected.transition_evaluator.last_accepted_decision is None
+    assert not list((rejected.run_directory / "curriculum-transitions" / "transfers").glob("*.pt"))
+
+
+def test_resume_finishes_pending_transition_before_next_rollout(tmp_path, monkeypatch) -> None:
+    base = _config(iterations=1)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    config = _with_transition(base, reference)
+    runner = TrainingRunner(config, tmp_path / "pending-transition")
+    metrics = runner._train_one_iteration()
+    runner.pending_transition_iteration = runner.iteration
+    source = runner.save_checkpoint(reason="transition_candidate", metrics=metrics)
+
+    restored = TrainingRunner.resume(source)
+    monkeypatch.setattr(restored, "_train_one_iteration", lambda: (_ for _ in ()).throw(AssertionError("rollout started before transition recovery")))
+    result = restored.run(until_iteration=1, install_signal_handlers=False)
+
+    assert not result.interrupted
+    assert restored.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+    assert restored.pending_transition_iteration is None
+
+
+def test_resume_recovers_transition_manifest_ahead_of_pending_source(tmp_path) -> None:
+    base = _config(iterations=1)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    config = _with_transition(base, reference)
+    runner = TrainingRunner(config, tmp_path / "manifest-ahead")
+    metrics = runner._train_one_iteration()
+    runner.pending_transition_iteration = runner.iteration
+    source = runner.save_checkpoint(reason="transition_candidate", metrics=metrics)
+    assert runner.transition_evaluator is not None
+    decision = runner.transition_evaluator.evaluate_transition(
+        iteration=runner.iteration,
+        candidate_checkpoint=source,
+        reference_checkpoint=reference,
+        stage=runner.scheduler.stage,
+        run_context={"run_config_sha256": train_runner_module._canonical_sha256(config.to_dict())},
+    )
+    assert decision.accepted
+
+    restored = TrainingRunner.resume(source)
+    restored.run(until_iteration=1, install_signal_handlers=False)
+
+    assert restored.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+    assert restored.pending_transition_iteration is None
+
+
+def test_resume_processes_due_transition_before_next_rollout(tmp_path, monkeypatch) -> None:
+    base = _config(iterations=2)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    config = _with_transition(base, reference)
+    runner = TrainingRunner(config, tmp_path / "due-after-interrupt")
+    runner.request_stop()
+    interrupted = runner.run(install_signal_handlers=False)
+    assert interrupted.interrupted and runner.scheduler.stage is CurriculumStage.A_HEADS_UP_STARTER
+
+    restored = TrainingRunner.resume(runner.latest_path)
+    original_train = restored._train_one_iteration
+
+    def assert_transition_first():
+        assert restored.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+        return original_train()
+
+    monkeypatch.setattr(restored, "_train_one_iteration", assert_transition_first)
+    restored.run(until_iteration=2, install_signal_handlers=False)
+    assert restored.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+
+
+def test_resume_after_transition_matches_uninterrupted_target_stage_stream(tmp_path) -> None:
+    base = _config(iterations=2)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    config = _with_transition(base, reference)
+
+    uninterrupted = TrainingRunner(config, tmp_path / "transition-uninterrupted")
+    uninterrupted.run(install_signal_handlers=False)
+
+    split = TrainingRunner(config, tmp_path / "transition-split")
+    split.run(until_iteration=1, install_signal_handlers=False)
+    resumed = TrainingRunner.resume(split.latest_path)
+    resumed.run(until_iteration=2, install_signal_handlers=False)
+
+    assert resumed.scheduler.stage is uninterrupted.scheduler.stage is CurriculumStage.B_HEADS_UP_FULL
+    assert resumed.trainer._seed_counter == uninterrupted.trainer._seed_counter
+    assert resumed.global_decisions == uninterrupted.global_decisions
+    assert all(
+        torch.equal(left, right)
+        for left, right in zip(resumed.model.state_dict().values(), uninterrupted.model.state_dict().values(), strict=True)
+    )
+
+
+def test_transition_config_rejects_unsafe_or_unsupported_automation(tmp_path) -> None:
+    base = _config(iterations=0)
+    reference = TrainingRunner(base, tmp_path / "reference-run").save_checkpoint(reason="reference")
+    transition = _with_transition(base, reference).transition
+    with pytest.raises(ValueError, match="cannot be enabled in the same run"):
+        TrainingRunConfig(
+            run=base.run,
+            model=base.model,
+            ppo=base.ppo,
+            curriculum=transition.curriculum,
+            league=base.league,
+            promotion=_promotion_config(),
+            transition=transition,
+        )
+    strict_curriculum = CurriculumConfig(base_learning_rate=base.ppo.learning_rate, require_transfer_beats_scratch=True)
+    with pytest.raises(ValueError, match="cannot require transfer-vs-scratch"):
+        TrainingRunConfig(
+            run=base.run,
+            model=base.model,
+            ppo=base.ppo,
+            curriculum=strict_curriculum,
+            league=base.league,
+            transition=CurriculumTransitionConfig(
+                enabled=True,
+                reference_checkpoint=str(reference),
+                reference_checkpoint_sha256=train_runner_module._file_sha256(reference),
+                curriculum=strict_curriculum,
+            ),
+        )
+    with pytest.raises(ValueError, match="only A -> B"):
+        CurriculumTransitionConfig(
+            source_stage=CurriculumStage.C_THREE_MAX,
+            target_stage=CurriculumStage.D_FIVE_MAX_FIXED,
+        )
 
 
 @pytest.mark.parametrize("stage", list(CurriculumStage))

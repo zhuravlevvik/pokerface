@@ -28,11 +28,11 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on non-RL installs.
 TORCH_AVAILABLE = torch is not None
 """Whether the optional PyTorch dependency is available in this environment."""
 
-# Version 2 changes the card pooling shape and adds order information to the
-# history encoder.  A v1 state dict cannot be loaded safely: aside from the
-# new parameters, its weights were trained on representations that conflate
-# private and board-card assignments and action order.
-MODEL_VERSION = "2.0"
+# Version 3 retains the v2 role-aware card and ordered-history encoders, then
+# adds an independent scalar expected-showdown-share head.  A v2 state dict is
+# not a normal v3 checkpoint because it has no parameters for that head; use
+# the explicit ``poker.model_migration`` tool when a warm start is intended.
+MODEL_VERSION = "3.0"
 ACTION_NAMES = ("fold", "check", "call", "raise")
 BET_SIZE_ACTIONS = (
     Action.RAISE_MIN.value,
@@ -44,6 +44,7 @@ BET_SIZE_ACTIONS = (
     Action.ALL_IN.value,
 )
 EQUITY_OUTCOMES = ("win", "tie", "loss")
+EQUITY_HEADS = ("outcome_v1", "expected_showdown_share_v1")
 
 _RANK_TO_ID = {rank: index + 1 for index, rank in enumerate("23456789TJQKA")}
 _SUIT_TO_ID = {suit: index + 1 for index, suit in enumerate("cdhs")}
@@ -95,6 +96,8 @@ class ModelOutput:
     value: Tensor
     equity_logits: Tensor
     equity_probabilities: Tensor
+    expected_showdown_share_logit: Tensor
+    expected_showdown_share: Tensor
     action_mask: Tensor
     bet_size_mask: Tensor
 
@@ -108,6 +111,7 @@ class InferenceDecision:
     bet_size_probabilities: dict[str, float]
     value_bb: float
     equity: dict[str, float]
+    expected_showdown_share: float
 
 
 if TORCH_AVAILABLE:
@@ -269,6 +273,7 @@ if TORCH_AVAILABLE:
             self.bet_size_head = nn.Linear(self.config.hidden_dim, len(BET_SIZE_ACTIONS))
             self.value_head = nn.Linear(self.config.hidden_dim, 1)
             self.equity_head = nn.Linear(self.config.hidden_dim, len(EQUITY_OUTCOMES))
+            self.expected_showdown_share_head = nn.Linear(self.config.hidden_dim, 1)
 
         def forward(self, observations: Sequence[Mapping[str, object]]) -> ModelOutput:
             """Run one batched forward pass for active decision observations.
@@ -289,6 +294,7 @@ if TORCH_AVAILABLE:
             action_logits = self._mask_logits(raw_action_logits, tensors["action_mask"])
             bet_size_logits = self._mask_logits(raw_bet_logits, tensors["bet_size_mask"], require_legal=False)
             equity_logits = self.equity_head(hidden)
+            expected_showdown_share_logit = self.expected_showdown_share_head(hidden).squeeze(-1)
             return ModelOutput(
                 action_logits=action_logits,
                 action_probabilities=torch.softmax(action_logits, dim=-1),
@@ -297,6 +303,8 @@ if TORCH_AVAILABLE:
                 value=self.value_head(hidden).squeeze(-1),
                 equity_logits=equity_logits,
                 equity_probabilities=torch.softmax(equity_logits, dim=-1),
+                expected_showdown_share_logit=expected_showdown_share_logit,
+                expected_showdown_share=torch.sigmoid(expected_showdown_share_logit),
                 action_mask=tensors["action_mask"],
                 bet_size_mask=tensors["bet_size_mask"],
             )
@@ -321,6 +329,7 @@ if TORCH_AVAILABLE:
                 bet_size_probabilities=bet_probabilities,
                 value_bb=float(output.value[0].item()),
                 equity={name: float(output.equity_probabilities[0, index].item()) for index, name in enumerate(EQUITY_OUTCOMES)},
+                expected_showdown_share=float(output.expected_showdown_share[0].item()),
             )
 
         def checkpoint_metadata(self) -> dict[str, object]:
@@ -332,6 +341,7 @@ if TORCH_AVAILABLE:
                 "action_space": list(ACTION_NAMES),
                 "bet_size_actions": list(BET_SIZE_ACTIONS),
                 "equity_outcomes": list(EQUITY_OUTCOMES),
+                "equity_heads": list(EQUITY_HEADS),
                 "config": asdict(self.config),
             }
 
@@ -364,6 +374,7 @@ if TORCH_AVAILABLE:
                 "action_space": list(ACTION_NAMES),
                 "bet_size_actions": list(BET_SIZE_ACTIONS),
                 "equity_outcomes": list(EQUITY_OUTCOMES),
+                "equity_heads": list(EQUITY_HEADS),
             }
             for name, value in expected.items():
                 if metadata.get(name) != value:
@@ -596,6 +607,7 @@ def _legal(legal_actions: Mapping[str, object], action: str) -> bool:
 __all__ = [
     "ACTION_NAMES",
     "BET_SIZE_ACTIONS",
+    "EQUITY_HEADS",
     "EQUITY_OUTCOMES",
     "MODEL_VERSION",
     "TORCH_AVAILABLE",

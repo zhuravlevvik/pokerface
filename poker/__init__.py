@@ -9,9 +9,12 @@ from .equity import (
     EquityMetrics,
     EquitySnapshot,
     EquityTarget,
+    ExpectedShowdownShareMetrics,
     capture_equity_snapshot,
     equity_cross_entropy,
     equity_metrics,
+    expected_showdown_share_binary_cross_entropy,
+    expected_showdown_share_metrics,
     generate_equity_target,
 )
 from .game_state import HandState, Street
@@ -39,7 +42,8 @@ from .model import (
     ModelOutput,
     PokerAgentModel,
 )
-from .inference import CheckpointInferenceService, HeuristicInferenceService, InferenceResponse
+from .inference import CheckpointInferenceService, HeuristicInferenceService, InferenceResponse, ScalarMetric
+from .model_migration import MIGRATION_VERSION, V2_MODEL_VERSION, migrate_v2_checkpoint
 from .game_server import GameServer, ObservableHand
 from .curriculum import (
     CheckpointTransfer,
@@ -65,6 +69,12 @@ from .pretraining import EquityBackbonePretrainer, PretrainingConfig, Pretrainin
 from .pretraining_data import PretrainingCorpus, SeedRange, generate_pretraining_corpus, load_pretraining_corpus, write_pretraining_corpus
 from .pretraining_runner import AcceptanceConfig, CorpusConfig, PretrainingRunConfig, PretrainingRunResult, PretrainingRunner
 from .promotion import PromotionConfig, PromotionEvaluation, PromotionEvaluator
+from .curriculum_transition import (
+    CurriculumTransitionConfig,
+    CurriculumTransitionEvaluator,
+    TransitionEvaluation,
+    TransitionEvidence,
+)
 
 __all__ = [
     "Action",
@@ -78,6 +88,8 @@ __all__ = [
     "CurriculumConfig",
     "CurriculumStage",
     "CurriculumStageSpec",
+    "CurriculumTransitionConfig",
+    "CurriculumTransitionEvaluator",
     "BotStatistics",
     "BET_SIZE_ACTIONS",
     "CallingStationBot",
@@ -90,6 +102,7 @@ __all__ = [
     "EquityMetrics",
     "EquitySnapshot",
     "EquityTarget",
+    "ExpectedShowdownShareMetrics",
     "HandState",
     "GameServer",
     "HeuristicInferenceService",
@@ -101,6 +114,9 @@ __all__ = [
     "ObservableHand",
     "InferenceDecision",
     "InferenceResponse",
+    "ScalarMetric",
+    "MIGRATION_VERSION",
+    "V2_MODEL_VERSION",
     "ModelConfig",
     "ModelDiagnostics",
     "ModelOutput",
@@ -138,6 +154,8 @@ __all__ = [
     "SeedRange",
     "TORCH_AVAILABLE",
     "TightBot",
+    "TransitionEvaluation",
+    "TransitionEvidence",
     "TournamentResult",
     "TracePretrainingDataset",
     "benchmark_hands",
@@ -145,11 +163,14 @@ __all__ = [
     "capture_equity_snapshot",
     "equity_cross_entropy",
     "equity_metrics",
+    "expected_showdown_share_binary_cross_entropy",
+    "expected_showdown_share_metrics",
     "evaluate_suite",
     "generate_equity_target",
     "generate_pretraining_dataset",
     "generate_pretraining_corpus",
     "load_pretraining_corpus",
+    "migrate_v2_checkpoint",
     "run_tournament",
     "run_sanity_checks",
     "observation_for",

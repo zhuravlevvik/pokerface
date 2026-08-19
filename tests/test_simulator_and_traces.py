@@ -46,6 +46,8 @@ def test_trace_captures_pre_action_safe_observation_and_terminal_pnl() -> None:
     assert first.legal_action_mask == first.observation["legal_actions"]
     assert all("hole_cards" not in player for player in first.observation["players"])
     assert first.terminal_pnl_bb == trace.terminal_pnl_bb[first.hero_seat]
+    assert first.expected_showdown_share_target is not None
+    assert 0.0 <= first.expected_showdown_share_target <= 1.0
     assert len(trace.as_training_records()) == len(trace.decisions)
 
 

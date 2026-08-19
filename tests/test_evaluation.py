@@ -27,7 +27,8 @@ def test_suite_uses_identical_fixed_deals_and_exact_position_rotation(tmp_path) 
         assert matchup.league_score == pytest.approx(matchup.win_rate + 0.5 * matchup.tie_rate)
     output = first.write_json(tmp_path / "reports" / "candidate.json")
     encoded = json.loads(output.read_text())
-    assert encoded["schema_version"] == "1.2"
+    assert encoded["schema_version"] == "2.0"
+    assert encoded["scalar_metric_protocol"] == "active_hands_expected_showdown_share_v1"
     assert 0.0 <= encoded["aggregate_league_score"] <= 1.0
     assert encoded["matchups"][0]["statistics"]["vpip"] >= 0
     assert encoded["matchups"][0]["bb_per_100_ci95_low"] <= encoded["matchups"][0]["bb_per_100"]
@@ -132,6 +133,9 @@ def test_model_suite_reports_all_required_diagnostics_and_sanity_checks() -> Non
     assert matchup.equity is not None
     assert matchup.equity.samples == matchup.model_diagnostics.decisions
     assert len(matchup.equity.calibration) == 5
+    assert matchup.expected_showdown_share is not None
+    assert matchup.expected_showdown_share.samples == matchup.model_diagnostics.decisions
+    assert len(matchup.expected_showdown_share.calibration) == 5
     assert {scenario.name for scenario in report.sanity_checks} == {
         "nuts_river",
         "lost_river",

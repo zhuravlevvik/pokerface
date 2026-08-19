@@ -68,7 +68,10 @@ def test_promotion_freezes_candidate_writes_auditable_report_and_restores_manife
 
     assert first.accepted and first.checkpoint_path is not None and first.checkpoint_path.exists()
     report = json.loads(first.report_path.read_text(encoding="utf-8"))
+    assert report["promotion_report_version"] == 2
     assert report["protocol"]["paired_position_seeds"] is True
+    assert report["protocol"]["scalar_metric_protocol"] == "active_hands_expected_showdown_share_v1"
+    assert report["suite"]["schema_version"] == "2.0"
     assert report["candidate"]["source_full_checkpoint_sha256"]
     assert report["suite"]["matchups"][0]["seed_blocks"] == 2
     assert report["decision"]["checkpoint_path"] == str(first.checkpoint_path)
@@ -87,6 +90,7 @@ def test_promotion_freezes_candidate_writes_auditable_report_and_restores_manife
     assert second.checkpoint_path is None
     assert "did not improve" in " ".join(second.reasons)
     manifest = json.loads(restored.archive_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["version"] == 2
     assert len(manifest["decisions"]) == 2
     assert len(manifest["promoted"]) == 1
 

@@ -1,10 +1,10 @@
-"""Reusable supervised warm-up for the poker model backbone and equity head.
+"""Reusable supervised warm-up for the poker model backbone and auxiliary heads.
 
 This module deliberately knows nothing about corpus generation, curriculum
 stages, command-line entry points, or the UI.  It accepts any sequence whose
 items expose the same fields as ``curriculum.PretrainingExample``:
-``observation``, ``selected_action``, ``equity_target`` and
-``terminal_pnl_bb``.  That keeps generated datasets, archived traces, and
+``observation``, ``selected_action``, ``equity_target``,
+``expected_showdown_share_target`` and ``terminal_pnl_bb``.  That keeps generated datasets, archived traces, and
 future streaming adapters interchangeable at this boundary.
 """
 
@@ -17,7 +17,14 @@ import random
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from uuid import uuid4
 
-from .equity import EquityMetrics, equity_cross_entropy, equity_metrics
+from .equity import (
+    EquityMetrics,
+    ExpectedShowdownShareMetrics,
+    equity_cross_entropy,
+    equity_metrics,
+    expected_showdown_share_binary_cross_entropy,
+    expected_showdown_share_metrics,
+)
 from .model import ACTION_NAMES, BET_SIZE_ACTIONS, TORCH_AVAILABLE, PokerAgentModel
 
 if TORCH_AVAILABLE:
@@ -25,7 +32,7 @@ if TORCH_AVAILABLE:
     from torch.nn import functional as F
 
 
-PRETRAINING_CHECKPOINT_VERSION = 1
+PRETRAINING_CHECKPOINT_VERSION = 2
 
 
 def _require_torch() -> None:
@@ -39,6 +46,7 @@ class PretrainingExampleLike(Protocol):
     observation: Mapping[str, object]
     selected_action: str
     equity_target: Sequence[float]
+    expected_showdown_share_target: float
     terminal_pnl_bb: float
 
 
@@ -49,7 +57,8 @@ BreakdownHook = Callable[[PretrainingExampleLike], str]
 class PretrainingConfig:
     """Configuration for deterministic minibatch supervised warm-up.
 
-    Equity soft-target cross entropy is always the primary loss.  Behaviour
+    Outcome soft-target cross entropy and scalar expected-showdown-share BCE
+    are the primary losses.  Behaviour
     cloning and value warm-up are deliberately opt-in: they are useful for a
     gentle initialisation, but should not force a rule bot's strategy or noisy
     terminal results into the policy by default.
@@ -61,6 +70,7 @@ class PretrainingConfig:
     seed: int = 0
     behavior_cloning_coefficient: float = 0.0
     value_warmup_coefficient: float = 0.0
+    expected_showdown_share_coefficient: float = 1.0
     value_huber_delta: float = 10.0
     max_grad_norm: float | None = 1.0
     weight_decay: float = 0.0
@@ -72,7 +82,11 @@ class PretrainingConfig:
             raise ValueError("learning_rate must be positive")
         if self.batch_size < 1 or self.epochs < 1:
             raise ValueError("batch_size and epochs must be positive")
-        if self.behavior_cloning_coefficient < 0 or self.value_warmup_coefficient < 0:
+        if min(
+            self.behavior_cloning_coefficient,
+            self.value_warmup_coefficient,
+            self.expected_showdown_share_coefficient,
+        ) < 0:
             raise ValueError("pretraining loss coefficients must be non-negative")
         if self.value_huber_delta <= 0:
             raise ValueError("value_huber_delta must be positive")
@@ -95,6 +109,7 @@ class PretrainingMetrics:
     equity_loss: float
     behavior_cloning_loss: float
     value_warmup_loss: float
+    expected_showdown_share_loss: float
 
 
 @dataclass(frozen=True)
@@ -104,6 +119,9 @@ class PretrainingValidation:
     equity: EquityMetrics
     breakdowns: Mapping[str, Mapping[str, EquityMetrics]]
     predictions: tuple[tuple[float, float, float], ...]
+    expected_showdown_share: ExpectedShowdownShareMetrics
+    expected_showdown_share_breakdowns: Mapping[str, Mapping[str, ExpectedShowdownShareMetrics]]
+    expected_showdown_share_predictions: tuple[float, ...]
 
 
 def _as_examples(examples: Sequence[PretrainingExampleLike] | Iterable[PretrainingExampleLike]) -> tuple[PretrainingExampleLike, ...]:
@@ -111,7 +129,7 @@ def _as_examples(examples: Sequence[PretrainingExampleLike] | Iterable[Pretraini
     if not rows:
         raise ValueError("pretraining examples must not be empty")
     for example in rows:
-        for name in ("observation", "selected_action", "equity_target", "terminal_pnl_bb"):
+        for name in ("observation", "selected_action", "equity_target", "expected_showdown_share_target", "terminal_pnl_bb"):
             if not hasattr(example, name):
                 raise TypeError(f"pretraining example has no {name!r} field")
         if not isinstance(example.observation, Mapping):
@@ -250,7 +268,7 @@ class EquityBackbonePretrainer:
     def train_epoch(self, examples: Sequence[PretrainingExampleLike] | Iterable[PretrainingExampleLike]) -> PretrainingMetrics:
         rows = _as_examples(examples)
         self.model.train()
-        totals = {"total": 0.0, "equity": 0.0, "behavior": 0.0, "value": 0.0}
+        totals = {"total": 0.0, "equity": 0.0, "share": 0.0, "behavior": 0.0, "value": 0.0}
         processed = 0
         permutation = self._indices_for_epoch(len(rows))
         for start in range(0, len(rows), self.config.batch_size):
@@ -259,6 +277,15 @@ class EquityBackbonePretrainer:
             output = self.model([item.observation for item in batch])
             targets = torch.tensor([item.equity_target for item in batch], dtype=torch.float32, device=self.device)
             equity_loss = equity_cross_entropy(output.equity_logits, targets)
+            share_targets = torch.tensor(
+                [item.expected_showdown_share_target for item in batch],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            share_loss = expected_showdown_share_binary_cross_entropy(
+                output.expected_showdown_share_logit,
+                share_targets,
+            )
             behavior_loss = torch.zeros((), dtype=equity_loss.dtype, device=self.device)
             if self.config.behavior_cloning_coefficient:
                 action_indices, size_indices = _action_labels(batch, self.device)
@@ -267,7 +294,12 @@ class EquityBackbonePretrainer:
             if self.config.value_warmup_coefficient:
                 values = torch.tensor([item.terminal_pnl_bb for item in batch], dtype=torch.float32, device=self.device)
                 value_loss = F.huber_loss(output.value, values, reduction="mean", delta=self.config.value_huber_delta)
-            loss = equity_loss + self.config.behavior_cloning_coefficient * behavior_loss + self.config.value_warmup_coefficient * value_loss
+            loss = (
+                equity_loss
+                + self.config.expected_showdown_share_coefficient * share_loss
+                + self.config.behavior_cloning_coefficient * behavior_loss
+                + self.config.value_warmup_coefficient * value_loss
+            )
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.config.max_grad_norm is not None:
@@ -277,6 +309,7 @@ class EquityBackbonePretrainer:
             processed += count
             totals["total"] += float(loss.detach().item()) * count
             totals["equity"] += float(equity_loss.detach().item()) * count
+            totals["share"] += float(share_loss.detach().item()) * count
             totals["behavior"] += float(behavior_loss.detach().item()) * count
             totals["value"] += float(value_loss.detach().item()) * count
             self.global_step += 1
@@ -289,6 +322,7 @@ class EquityBackbonePretrainer:
             equity_loss=totals["equity"] / processed,
             behavior_cloning_loss=totals["behavior"] / processed,
             value_warmup_loss=totals["value"] / processed,
+            expected_showdown_share_loss=totals["share"] / processed,
         )
 
     def fit(
@@ -317,18 +351,23 @@ class EquityBackbonePretrainer:
         was_training = self.model.training
         self.model.eval()
         predictions: list[tuple[float, float, float]] = []
+        share_predictions: list[float] = []
         try:
             with torch.no_grad():
                 for start in range(0, len(rows), self.config.batch_size):
                     batch = rows[start : start + self.config.batch_size]
                     output = self.model([item.observation for item in batch])
                     predictions.extend(tuple(float(value) for value in row) for row in output.equity_probabilities.detach().cpu().tolist())
+                    share_predictions.extend(float(value) for value in output.expected_showdown_share.detach().cpu().tolist())
         finally:
             if was_training:
                 self.model.train()
         targets = [tuple(float(value) for value in item.equity_target) for item in rows]
         overall = equity_metrics(predictions, targets, bins=self.config.calibration_bins)
+        share_targets = [float(item.expected_showdown_share_target) for item in rows]
+        overall_share = expected_showdown_share_metrics(share_predictions, share_targets, bins=self.config.calibration_bins)
         sliced: dict[str, dict[str, EquityMetrics]] = {}
+        sliced_shares: dict[str, dict[str, ExpectedShowdownShareMetrics]] = {}
         for name, hook in (breakdowns or {}).items():
             groups: dict[str, list[int]] = {}
             for index, example in enumerate(rows):
@@ -337,7 +376,22 @@ class EquityBackbonePretrainer:
                 key: equity_metrics([predictions[index] for index in indices], [targets[index] for index in indices], bins=self.config.calibration_bins)
                 for key, indices in groups.items()
             }
-        return PretrainingValidation(overall, sliced, tuple(predictions))
+            sliced_shares[name] = {
+                key: expected_showdown_share_metrics(
+                    [share_predictions[index] for index in indices],
+                    [share_targets[index] for index in indices],
+                    bins=self.config.calibration_bins,
+                )
+                for key, indices in groups.items()
+            }
+        return PretrainingValidation(
+            overall,
+            sliced,
+            tuple(predictions),
+            overall_share,
+            sliced_shares,
+            tuple(share_predictions),
+        )
 
     def checkpoint_payload(self) -> dict[str, Any]:
         """A weights-only-safe payload that inference can load as a model."""

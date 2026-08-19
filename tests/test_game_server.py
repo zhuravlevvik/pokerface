@@ -5,7 +5,7 @@ import json
 import pytest
 
 from poker.game_server import GameServer, SeatPolicyRouter
-from poker.inference import InferenceResponse, validate_response
+from poker.inference import HEURISTIC_HAND_STRENGTH_PROTOCOL, InferenceResponse, ScalarMetric, validate_response
 
 
 def _events(*, mode: str = "player") -> list[dict[str, object]]:
@@ -54,10 +54,14 @@ def test_action_events_expose_full_inference_contract() -> None:
     event = next(event for event in _events(mode="spectator") if event["type"] == "action")
     analysis = event["analysis"]
     assert isinstance(analysis, dict)
-    assert set(analysis) == {"action", "action_probabilities", "bet_size_probabilities", "equity", "value_bb"}
-    assert set(analysis["equity"]) == {"win", "tie", "loss", "total"}
+    assert set(analysis) == {"action", "action_probabilities", "bet_size_probabilities", "equity", "value_bb", "scalar_metric"}
+    assert set(analysis["equity"]) == {"win", "tie", "loss"}
     assert sum(analysis["equity"][key] for key in ("win", "tie", "loss")) == pytest.approx(1.0)
-    assert analysis["equity"]["total"] == pytest.approx(analysis["equity"]["win"] + 0.5 * analysis["equity"]["tie"])
+    assert analysis["scalar_metric"] == {
+        "name": "heuristic_hand_strength",
+        "protocol": HEURISTIC_HAND_STRENGTH_PROTOCOL,
+        "value": pytest.approx(analysis["equity"]["win"]),
+    }
 
 
 def test_player_mode_redacts_opponent_private_analysis_from_events_and_replay() -> None:
@@ -77,13 +81,42 @@ def test_player_mode_redacts_opponent_private_analysis_from_events_and_replay() 
             assert record["analysis"] is None
 
 
+def test_importing_spectator_replay_in_player_mode_redacts_private_analysis() -> None:
+    spectator = _events(mode="spectator")[-1]["replay"]
+    assert isinstance(spectator, dict)
+    assert any(
+        record["seat"] != 0 and record["analysis"] is not None
+        for record in spectator["analyses"]
+    )
+
+    imported = GameServer().replay_hand(spectator, hero_seat=0, mode="player")
+    for event in imported:
+        if event["type"] == "action" and event["seat"] != 0:
+            assert event["analysis"] is None
+    replay = imported[-1]["replay"]
+    assert isinstance(replay, dict)
+    assert all("hole_cards" not in player for player in replay["players"])
+    assert all(point["seat"] == 0 for point in replay["equity_points"])
+    assert all(
+        record["seat"] == 0 or record["analysis"] is None
+        for record in replay["analyses"]
+    )
+
+
 def test_inference_response_rejects_illegal_action_and_bad_equity() -> None:
-    illegal = InferenceResponse("fold", {}, {}, {"win": 1.0, "tie": 0.0, "loss": 0.0, "total": 1.0}, 0.0)
+    illegal = InferenceResponse("fold", {}, {}, {"win": 1.0, "tie": 0.0, "loss": 0.0}, 0.0)
     with pytest.raises(ValueError, match="illegal"):
         validate_response(illegal, {"fold": False})
-    inconsistent = InferenceResponse("call", {}, {}, {"win": 0.5, "tie": 0.0, "loss": 0.5, "total": 0.9}, 0.0)
-    with pytest.raises(ValueError, match="inconsistent"):
-        validate_response(inconsistent, {"call": True})
+    invalid_metric = InferenceResponse(
+        "call",
+        {},
+        {},
+        {"win": 0.5, "tie": 0.0, "loss": 0.5},
+        0.0,
+        ScalarMetric("expected_showdown_share", 0.9, "not-a-protocol"),
+    )
+    with pytest.raises(ValueError, match="protocol"):
+        validate_response(invalid_metric, {"call": True})
 
 
 def test_seat_policy_router_dispatches_each_observation_to_its_own_service() -> None:
@@ -96,7 +129,7 @@ def test_seat_policy_router_dispatches_each_observation_to_its_own_service() -> 
             assert isinstance(observation, dict)
             self.calls.append(observation["seat"])
             return InferenceResponse(
-                self.action, {}, {}, {"win": 1.0, "tie": 0.0, "loss": 0.0, "total": 1.0}, 0.0
+                self.action, {}, {}, {"win": 1.0, "tie": 0.0, "loss": 1.0 - 1.0}, 0.0
             )
 
     first, second = Marker("check"), Marker("call")
@@ -154,3 +187,34 @@ def test_checkpoint_catalog_uses_a_safe_id_instead_of_a_client_path() -> None:
     assert {policy["id"] for policy in server.available_policies()} >= {"checkpoint:candidate", "bot:rule"}
     with pytest.raises(ValueError, match="not in the server catalog"):
         server.observe_hand(player_count=2, seat_policies={0: "checkpoint:/tmp/not-allowed"})
+
+
+@pytest.mark.parametrize("player_count", [3, 5])
+def test_multiway_replay_points_are_typed_and_never_use_heads_up_total(player_count: int) -> None:
+    events = GameServer().observe_hand(seed=912, player_count=player_count, hero_seat=0, mode="spectator")
+    replay = events[-1]["replay"]
+    assert isinstance(replay, dict)
+    points = replay["equity_points"]
+    assert points
+    assert all(set(point) == {"street", "seat", "metric", "value", "protocol", "action_index"} for point in points)
+    assert all(point["metric"] == "heuristic_hand_strength" for point in points)
+    assert all("equity" not in point and "total" not in point for point in points)
+
+
+def test_legacy_untyped_scalar_replay_is_rejected_without_provenance() -> None:
+    hu = GameServer().observe_hand(seed=811, player_count=2, hero_seat=0, mode="spectator")[-1]["replay"]
+    assert isinstance(hu, dict)
+    legacy = dict(hu)
+    legacy["equity_points"] = [
+        {"street": point["street"], "seat": point["seat"], "equity": point["value"], "action_index": point["action_index"]}
+        for point in hu["equity_points"]
+    ]
+    with pytest.raises(ValueError, match="typed scalar"):
+        GameServer().replay_hand(legacy, hero_seat=0, mode="spectator")
+
+    multiway = GameServer().observe_hand(seed=812, player_count=3, hero_seat=0, mode="spectator")[-1]["replay"]
+    assert isinstance(multiway, dict)
+    invalid = dict(multiway)
+    invalid["equity_points"] = [{"street": "preflop", "seat": 0, "equity": 0.5, "action_index": 0}]
+    with pytest.raises(ValueError, match="typed scalar"):
+        GameServer().replay_hand(invalid, hero_seat=0, mode="spectator")

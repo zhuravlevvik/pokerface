@@ -13,7 +13,8 @@ Action-history tokens ──> Small Transformer ───┘
                                                    ├─ action head
                                                    ├─ bet-size head
                                                    ├─ value head
-                                                   └─ equity head
+                                                   ├─ outcome head
+                                                   └─ expected-showdown-share head
 ```
 
 - Карты — эмбеддинги ранга, масти и роли (private/public).
@@ -27,6 +28,15 @@ Action-history tokens ──> Small Transformer ───┘
 - `bet_size_head`: logits для дискретных рейз-сайзингов; используется лишь при `raise`.
 - `value_head`: ожидаемый будущий PnL в BB.
 - `equity_head`: softmax по `[win, tie, loss]`.
+- `expected_showdown_share_head`: sigmoid скаляра `0..1`, корректного для
+  2/3/5 активных рук.
+
+Текущая версия модели — `3.0`. Обычная загрузка checkpoint `2.0` отклоняется,
+поскольку в нём нет новой головы. Явный warm start выполняется функцией
+`poker.migrate_v2_checkpoint(source, destination, expected_showdown_share_init_seed=...)`:
+она bit-for-bit переносит совместимые веса, детерминированно инициализирует
+только новую голову и записывает lineage. Optimizer/RNG полного run при этом
+не переносятся.
 
 ## Действия
 

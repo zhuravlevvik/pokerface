@@ -46,6 +46,7 @@ class PPOConfig:
     clip_ratio: float = 0.2
     value_coefficient: float = 0.5
     equity_coefficient: float = 0.1
+    expected_showdown_share_coefficient: float = 0.1
     entropy_coefficient: float = 0.01
     learning_rate: float = 3e-4
     epochs: int = 2
@@ -58,7 +59,13 @@ class PPOConfig:
             raise ValueError("gamma and gae_lambda must be in [0, 1]")
         if not 0.0 < self.clip_ratio < 1.0:
             raise ValueError("clip_ratio must be in (0, 1)")
-        if min(self.value_coefficient, self.equity_coefficient, self.entropy_coefficient, self.learning_rate) < 0:
+        if min(
+            self.value_coefficient,
+            self.equity_coefficient,
+            self.expected_showdown_share_coefficient,
+            self.entropy_coefficient,
+            self.learning_rate,
+        ) < 0:
             raise ValueError("PPO coefficients and learning_rate must be non-negative")
         if self.epochs < 1 or self.minibatch_size < 1 or self.equity_samples < 1:
             raise ValueError("epochs, minibatch_size and equity_samples must be positive")
@@ -77,6 +84,7 @@ class RolloutStep:
     old_log_probability: float
     old_value: float
     equity_target: tuple[float, float, float] | None = None
+    expected_showdown_share_target: float | None = None
     reward: float = 0.0
     terminal: bool = False
     advantage: float = 0.0
@@ -113,6 +121,7 @@ class UpdateMetrics:
     entropy: float
     approximate_kl: float
     clip_fraction: float
+    expected_showdown_share_loss: float = 0.0
 
 
 def factorized_logprob_and_entropy(output, action_indices: Tensor, bet_size_indices: Tensor) -> tuple[Tensor, Tensor]:
@@ -327,6 +336,10 @@ class PPOTrainer:
                         if target is None or len(target) != 3:
                             raise RuntimeError("terminal current-policy trace has no equity target")
                         step.equity_target = (float(target[0]), float(target[1]), float(target[2]))
+                        expected_share = decision.expected_showdown_share_target
+                        if expected_share is None:
+                            raise RuntimeError("terminal current-policy trace has no expected showdown share target")
+                        step.expected_showdown_share_target = float(expected_share)
                     self._finish_hand(per_table[table], result.rewards[table])
                     all_steps.extend(per_table[table])
             completed_hands += batch_size
@@ -354,8 +367,8 @@ class PPOTrainer:
 
         if not rollout.steps:
             raise ValueError("rollout contains no current-policy decisions")
-        if any(step.equity_target is None for step in rollout.steps):
-            raise ValueError("rollout must be terminal and carry equity targets")
+        if any(step.equity_target is None or step.expected_showdown_share_target is None for step in rollout.steps):
+            raise ValueError("rollout must be terminal and carry outcome/share targets")
         self.model.train()
         advantages = torch.tensor([step.advantage for step in rollout.steps], dtype=torch.float32, device=self.device)
         advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
@@ -364,7 +377,12 @@ class PPOTrainer:
         actions = torch.tensor([step.action_index for step in rollout.steps], dtype=torch.long, device=self.device)
         sizes = torch.tensor([step.bet_size_index for step in rollout.steps], dtype=torch.long, device=self.device)
         targets = torch.tensor([step.equity_target for step in rollout.steps], dtype=torch.float32, device=self.device)
-        totals = {"total": 0.0, "policy": 0.0, "value": 0.0, "equity": 0.0, "entropy": 0.0, "kl": 0.0, "clip": 0.0}
+        share_targets = torch.tensor(
+            [step.expected_showdown_share_target for step in rollout.steps],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        totals = {"total": 0.0, "policy": 0.0, "value": 0.0, "equity": 0.0, "share": 0.0, "entropy": 0.0, "kl": 0.0, "clip": 0.0}
         updates = 0
         count = len(rollout.steps)
         for _ in range(self.config.epochs):
@@ -378,7 +396,17 @@ class PPOTrainer:
                 policy_loss = -torch.minimum(surrogate_a, surrogate_b).mean()
                 value_loss = F.mse_loss(output.value, returns[indices])
                 equity_loss = -(targets[indices] * F.log_softmax(output.equity_logits, dim=-1)).sum(dim=-1).mean()
-                total_loss = policy_loss + self.config.value_coefficient * value_loss + self.config.equity_coefficient * equity_loss - self.config.entropy_coefficient * entropy.mean()
+                expected_share_loss = F.binary_cross_entropy_with_logits(
+                    output.expected_showdown_share_logit,
+                    share_targets[indices],
+                )
+                total_loss = (
+                    policy_loss
+                    + self.config.value_coefficient * value_loss
+                    + self.config.equity_coefficient * equity_loss
+                    + self.config.expected_showdown_share_coefficient * expected_share_loss
+                    - self.config.entropy_coefficient * entropy.mean()
+                )
                 self.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
@@ -388,6 +416,7 @@ class PPOTrainer:
                     totals["policy"] += float(policy_loss.item())
                     totals["value"] += float(value_loss.item())
                     totals["equity"] += float(equity_loss.item())
+                    totals["share"] += float(expected_share_loss.item())
                     totals["entropy"] += float(entropy.mean().item())
                     totals["kl"] += float((old_logprobs[indices] - new_logprobs).mean().item())
                     totals["clip"] += float(((ratio - 1.0).abs() > self.config.clip_ratio).float().mean().item())
@@ -401,6 +430,7 @@ class PPOTrainer:
             entropy=totals["entropy"] / updates,
             approximate_kl=totals["kl"] / updates,
             clip_fraction=totals["clip"] / updates,
+            expected_showdown_share_loss=totals["share"] / updates,
         )
 
     def train_iteration(self, hand_count: int, **rollout_kwargs: Any) -> tuple[Rollout, UpdateMetrics]:

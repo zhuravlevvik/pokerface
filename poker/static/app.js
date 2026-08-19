@@ -7,6 +7,12 @@
   const pct = (value) => `${(100 * value).toFixed(1)}%`;
   const playerCount = () => Number(byId('player-count').value);
   const playbackDelay = () => Math.max(40, 420 / Number(byId('speed').value));
+  function metricLabel(metric, protocol) {
+    if (metric === 'expected_showdown_share' && protocol === 'active_hands_expected_showdown_share_v1') return 'Ожидаемая доля при showdown среди активных рук';
+    if (metric === 'heuristic_hand_strength' && protocol === 'heuristic_hand_strength_v1') return 'Эвристическая сила руки (не equity модели)';
+    if (metric === 'heads_up_showdown_share' && protocol === 'legacy_win_plus_half_tie_heads_up_v1') return 'HU equity (старый replay)';
+    return metric || 'Скалярная оценка';
+  }
 
   function renderBars(target, probabilities) {
     target.replaceChildren(...Object.entries(probabilities || {}).map(([name, value]) => {
@@ -41,8 +47,15 @@
     const ns = 'http://www.w3.org/2000/svg';
     const make = (name, attrs) => { const el = document.createElementNS(ns, name); Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k,v)); return el; };
     svg.append(make('line', {x1: 18,y1:112,x2:310,y2:112,class:'axis'})); svg.append(make('line',{x1:18,y1:12,x2:18,y2:112,class:'axis'}));
-    if (points.length) { const coords = points.map((point, index) => [18 + index * (292 / Math.max(1, points.length - 1)), 112 - point.equity * 100]); svg.append(make('polyline', {points: coords.map(p => p.join(',')).join(' '), class:'line'})); coords.forEach(([x,y]) => svg.append(make('circle',{cx:x,cy:y,r:4,class:'dot'}))); }
-    byId('equity-labels').textContent = points.map(p => `${p.street}: ${pct(p.equity)}`).join(' → ') || 'Нет решений героя';
+    if (points.length) {
+      const coords = points.map((point, index) => [18 + index * (292 / Math.max(1, points.length - 1)), 112 - point.value * 100]);
+      svg.append(make('polyline', {points: coords.map(p => p.join(',')).join(' '), class:'line'}));
+      coords.forEach(([x,y]) => svg.append(make('circle',{cx:x,cy:y,r:4,class:'dot'})));
+    }
+    const first = points[0];
+    byId('scalar-graph-title').textContent = first ? metricLabel(first.metric, first.protocol) : 'Скалярная оценка героя';
+    svg.setAttribute('aria-label', first ? metricLabel(first.metric, first.protocol) : 'График скалярной оценки');
+    byId('equity-labels').textContent = points.map(p => `${p.street}: ${pct(p.value)}`).join(' → ') || 'Нет решений героя';
   }
   function renderSummary(summary) {
     const policyNames = Object.values(summary.policies || {}).map((policy) => policy.name).join(' vs ');
@@ -55,7 +68,9 @@
       const a = event.analysis; const name = event.policy ? ` (${event.policy.name})` : '';
       byId('selected-action').textContent = `Выбрано${name}: ${a.action}`;
       byId('value').textContent = `${a.value_bb.toFixed(2)} BB`;
-      byId('equity').textContent = `${pct(a.equity.total)} (win ${pct(a.equity.win)}, tie ${pct(a.equity.tie)})`;
+      const metric = a.scalar_metric;
+      const outcomes = `win ${pct(a.equity.win)}, tie ${pct(a.equity.tie)}, loss ${pct(a.equity.loss)}`;
+      byId('equity').textContent = metric ? `${metricLabel(metric.name, metric.protocol)}: ${pct(metric.value)} (${outcomes})` : outcomes;
       renderBars(byId('action-probs'), a.action_probabilities); renderBars(byId('size-probs'), a.bet_size_probabilities);
     }
     if (event.type === 'series_started') renderSummary({hands: event.series.hands, policies: event.series.policies, pnl: {}});

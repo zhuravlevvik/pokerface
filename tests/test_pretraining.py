@@ -37,6 +37,7 @@ def _examples(count: int = 6):
                     "observation": observation_for(state, state.actor),
                     "selected_action": BET_SIZE_ACTIONS[seed % len(BET_SIZE_ACTIONS)],
                     "equity_target": (0.2 + 0.1 * (seed % 3), 0.1, 0.7 - 0.1 * (seed % 3)),
+                    "expected_showdown_share_target": 0.25 + 0.1 * (seed % 3),
                     "terminal_pnl_bb": float(seed - 3),
                 },
             )()
@@ -53,7 +54,16 @@ def test_equity_pretraining_loss_is_finite_and_changes_parameters() -> None:
     metrics = trainer.train_epoch(_examples())
 
     assert metrics.samples == 6
-    assert all(torch.isfinite(torch.tensor(value)) for value in (metrics.total_loss, metrics.equity_loss, metrics.behavior_cloning_loss, metrics.value_warmup_loss))
+    assert all(
+        torch.isfinite(torch.tensor(value))
+        for value in (
+            metrics.total_loss,
+            metrics.equity_loss,
+            metrics.expected_showdown_share_loss,
+            metrics.behavior_cloning_loss,
+            metrics.value_warmup_loss,
+        )
+    )
     assert metrics.behavior_cloning_loss == 0.0
     assert any(not torch.equal(before[name], value) for name, value in model.state_dict().items())
 
@@ -164,4 +174,6 @@ def test_validation_reports_equity_quality_and_hook_breakdowns() -> None:
     assert report.equity.logloss >= 0.0
     assert report.equity.brier_score >= 0.0
     assert report.equity.expected_calibration_error >= 0.0
+    assert report.expected_showdown_share.samples == len(rows)
+    assert report.expected_showdown_share.mean_absolute_error >= 0.0
     assert set(report.breakdowns["action"]) == {row.selected_action for row in rows}
