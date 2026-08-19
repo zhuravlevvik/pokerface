@@ -104,6 +104,29 @@ transfer artifact, переводит stage на B, сбрасывает optimiz
 `curriculum-transitions/`: resume проверяет hash manifest, candidate, report
 и transfer artifact и остановится при несогласованном состоянии.
 
+## Парный переход между любыми соседними stages
+
+Для настоящего transfer-vs-scratch сравнения используется отдельная команда,
+которая сохраняет `TrainingRunner` single-stage и создаёт два target-stage
+segment:
+
+```bash
+.venv/bin/python -m poker.curriculum_cli \
+  --write-default-config configs/b-to-c-paired.json
+
+.venv/bin/python -m poker.curriculum_cli \
+  --config configs/b-to-c-paired.json \
+  --run-dir runs/b-to-c-paired \
+  --source-checkpoint runs/hu-b/checkpoints/latest.pt \
+  --reference-checkpoint runs/hu-b-reference/checkpoints/latest.pt
+```
+
+Команда допускает только соседнюю пару, fixed bot или SHA-pinned checkpoint
+для каждого evaluation seat, common-deal multiway CI и обязательные
+expected-showdown-share strata. Первый `Ctrl+C` сохраняет целую границу arm;
+та же команда продолжает по intent/manifest. Подробный контракт — в
+[17_paired_multiway_curriculum.md](17_paired_multiway_curriculum.md).
+
 ## Просмотр checkpoint'а
 
 Full training checkpoint совместим с inference loader. Запустить несколько

@@ -7,14 +7,11 @@ Stage A (сокращённые сайзинги) к Stage B (полный на�
 утверждает, что модель сильная сама по себе: переход разрешается лишь по
 зафиксированному evaluation-протоколу и оставляет проверяемые артефакты.
 
-Автоматизация Stage C--E намеренно заблокирована. Для неё сначала нужны:
-
-1. настоящий парный scratch rung с тем же бюджетом, seed'ами и протоколом,
-   что и transfer. Автомат A→B такой rung не создаёт.
-
-Отдельная multiway-корректная `expected_showdown_share` head уже реализована,
-но сама по себе не доказывает качество transfer и не снимает scratch-rung
-блокировку C--E.
+Этот встроенный механизм остаётся только A→B и сам не содержит scratch-arm.
+Новый отдельный coordinator с настоящим paired rung и multiway gate описан в
+[17_paired_multiway_curriculum.md](17_paired_multiway_curriculum.md). Он не
+расширяет mutable stage этого legacy run, а создаёт отдельные target-stage
+segments с full checkpoints.
 
 ## Конфигурация и запуск
 
