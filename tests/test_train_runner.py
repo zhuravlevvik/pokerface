@@ -73,6 +73,10 @@ def _with_promotion(config: TrainingRunConfig, promotion: PromotionConfig) -> Tr
         promotion=promotion,
         transition=config.transition,
         init_checkpoint=config.init_checkpoint,
+        init_checkpoint_sha256=config.init_checkpoint_sha256,
+        init_checkpoint_kind=config.init_checkpoint_kind,
+        init_evidence_path=config.init_evidence_path,
+        init_evidence_sha256=config.init_evidence_sha256,
     )
 
 
@@ -107,6 +111,10 @@ def _with_transition(config: TrainingRunConfig, reference_checkpoint, *, accept:
         promotion=config.promotion,
         transition=transition,
         init_checkpoint=config.init_checkpoint,
+        init_checkpoint_sha256=config.init_checkpoint_sha256,
+        init_checkpoint_kind=config.init_checkpoint_kind,
+        init_evidence_path=config.init_evidence_path,
+        init_evidence_sha256=config.init_evidence_sha256,
     )
 
 
@@ -162,16 +170,47 @@ def test_fresh_runner_can_warm_start_weights_without_restoring_run_state(tmp_pat
     checkpoint = tmp_path / f"{source_kind}.pt"
     if source_kind == "ordinary":
         source.save_checkpoint(checkpoint)
+        runner = TrainingRunner(config, tmp_path / f"warm-{source_kind}", init_checkpoint=checkpoint)
     else:
-        EquityBackbonePretrainer(source, PretrainingConfig(batch_size=2)).save_checkpoint(checkpoint)
-
-    runner = TrainingRunner(config, tmp_path / f"warm-{source_kind}", init_checkpoint=checkpoint)
+        provenance = {
+            "run_config_sha256": "1" * 64,
+            "corpus_sha256": "2" * 64,
+            "equity_label_protocol": "fixed_deal_expected_showdown_share_v2",
+        }
+        EquityBackbonePretrainer(
+            source,
+            PretrainingConfig(batch_size=2),
+            provenance=provenance,
+        ).save_checkpoint(checkpoint)
+        evidence = tmp_path / "pretraining-report.json"
+        evidence.write_text(json.dumps({
+            "stage": config.run.stage.value,
+            "run_config_sha256": provenance["run_config_sha256"],
+            "corpus_sha256": provenance["corpus_sha256"],
+            "label_protocol": provenance["equity_label_protocol"],
+            "acceptance": {"passed": True},
+        }), encoding="utf-8")
+        warm_config = TrainingRunConfig(
+            run=config.run,
+            model=config.model,
+            ppo=config.ppo,
+            curriculum=config.curriculum,
+            league=config.league,
+            init_checkpoint=str(checkpoint),
+            init_checkpoint_sha256=train_runner_module._file_sha256(checkpoint),
+            init_checkpoint_kind="pretraining",
+            init_evidence_path=str(evidence),
+            init_evidence_sha256=train_runner_module._file_sha256(evidence),
+        )
+        runner = TrainingRunner(warm_config, tmp_path / f"warm-{source_kind}")
 
     assert runner.iteration == runner.global_decisions == runner.global_hands == 0
     assert runner.trainer._seed_counter == config.run.seed
     assert not runner.trainer.optimizer.state
     assert all(torch.equal(actual, expected) for actual, expected in zip(runner.model.state_dict().values(), source.state_dict().values(), strict=True))
-    assert runner.manifest["initialization"]["kind"] == "model_weights_only"
+    assert runner.manifest["initialization"]["kind"] == (
+        "model_weights_only" if source_kind == "ordinary" else "pretraining"
+    )
     assert runner.manifest["initialization"]["checkpoint"] == str(checkpoint)
 
 
@@ -198,6 +237,58 @@ def test_warm_start_rejects_incompatible_metadata_and_resume_rejects_model_check
         TrainingRunner(incompatible_config, tmp_path / "wrong-architecture", init_checkpoint=checkpoint)
     with pytest.raises(ValueError, match="not a compatible resumable training checkpoint"):
         TrainingRunner.resume(checkpoint)
+
+
+def test_configured_warm_start_is_hash_pinned_and_resume_binds_lineage(tmp_path) -> None:
+    base = _config(iterations=0)
+    source = PokerAgentModel(base.model)
+    checkpoint = tmp_path / "source.pt"
+    source.save_checkpoint(checkpoint)
+    source_sha = train_runner_module._file_sha256(checkpoint)
+    config = TrainingRunConfig(
+        run=base.run,
+        model=base.model,
+        ppo=base.ppo,
+        curriculum=base.curriculum,
+        league=base.league,
+        init_checkpoint=str(checkpoint),
+        init_checkpoint_sha256=source_sha,
+        init_checkpoint_kind="model_weights_only",
+    )
+    runner = TrainingRunner(config, tmp_path / "pinned")
+    full = runner.save_checkpoint(reason="complete")
+    assert TrainingRunner.resume(full).config.init_checkpoint_sha256 == source_sha
+
+    payload = torch.load(full, map_location="cpu", weights_only=True)
+    payload["manifest"]["initialization"]["checkpoint_sha256"] = "0" * 64
+    tampered_full = tmp_path / "tampered-full.pt"
+    torch.save(payload, tampered_full)
+    with pytest.raises(ValueError, match="initialization provenance"):
+        TrainingRunner.resume(tampered_full)
+
+    with torch.no_grad():
+        next(source.parameters()).add_(1.0)
+    source.save_checkpoint(checkpoint)
+    with pytest.raises(ValueError, match="init checkpoint SHA-256"):
+        TrainingRunner(config, tmp_path / "changed-source")
+
+
+def test_pretraining_warm_start_requires_hash_pinned_evidence(tmp_path) -> None:
+    base = _config(iterations=0)
+    source = PokerAgentModel(base.model)
+    checkpoint = tmp_path / "pretraining.pt"
+    EquityBackbonePretrainer(source, PretrainingConfig(batch_size=2)).save_checkpoint(checkpoint)
+    with pytest.raises(ValueError, match="init_evidence_path"):
+        TrainingRunConfig(
+            run=base.run,
+            model=base.model,
+            ppo=base.ppo,
+            curriculum=base.curriculum,
+            league=base.league,
+            init_checkpoint=str(checkpoint),
+            init_checkpoint_sha256=train_runner_module._file_sha256(checkpoint),
+            init_checkpoint_kind="pretraining",
+        )
 
 
 def test_requested_graceful_stop_writes_interrupt_checkpoint_at_safe_boundary(tmp_path) -> None:

@@ -22,7 +22,7 @@ if TORCH_AVAILABLE:
     import torch
 
 
-PROMOTION_REPORT_VERSION = 2
+PROMOTION_REPORT_VERSION = 3
 PROMOTION_BASELINES = ("rule", "tight", "aggro", "calling_station", "random")
 
 
@@ -233,6 +233,7 @@ class PromotionEvaluator:
             "paired_position_seeds": True,
             "ci_method": "paired_position_seed_block_normal_v1",
             "seed_start": self.config.seed_start,
+            "evaluation_run_seed": self.run_seed,
             "seed_blocks_per_opponent": self.config.hands_per_opponent // 2,
         }
         report = {

@@ -312,6 +312,8 @@ class PairedRungRunner:
                 ),
                 league=self._league_config(),
                 init_checkpoint=init_checkpoint,
+                init_checkpoint_sha256=self.source_sha256 if name == "transfer" else None,
+                init_checkpoint_kind="model_weights_only" if name == "transfer" else None,
             ),
             self._native_arm_directory(name),
             device=self.device,
@@ -428,6 +430,8 @@ class PairedRungRunner:
             ),
             league=self._league_config(),
             init_checkpoint=str(self.source_path) if name == "transfer" else None,
+            init_checkpoint_sha256=self.source_sha256 if name == "transfer" else None,
+            init_checkpoint_kind="model_weights_only" if name == "transfer" else None,
         ).to_dict()
 
     def _native_arm_directory(self, name: str) -> Path:

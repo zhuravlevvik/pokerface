@@ -32,6 +32,7 @@
 16. [Автоматический переход curriculum A → B](16_curriculum_transition.md)
 17. [Парный transfer-vs-scratch curriculum A → E](17_paired_multiway_curriculum.md)
 18. [Experiment ledger, tuning и release evidence](18_experiment_ledger_and_tuning.md)
+19. [Stage A multi-seed campaign](19_stage_a_multiseed_campaign.md)
 
 Текущее состояние реализации и доказательства проверок: [release-readiness audit](12_release_readiness.md).
 

@@ -109,6 +109,7 @@ def _artifacts(tmp_path):
         run_context={
             "run_config_sha256": trial.run_config_sha256,
             "evaluation_protocol_sha256": protocol_sha,
+            "evaluation_run_seed": 0,
         },
     )
     assert promoted.accepted

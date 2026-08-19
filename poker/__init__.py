@@ -105,9 +105,20 @@ from .tuning import (
     hu_promotion_protocol_payload,
     materialize_sweep,
     publish_tuning_evaluation,
+    single_experiment_trial,
     write_hu_promotion_protocol,
 )
 from .releases import LineageArtifact, ReleaseRecord, ReleaseRegistry, ReleaseRequest
+from .campaign import (
+    CampaignConfig,
+    CampaignReport,
+    CampaignVariant,
+    aggregate_campaign,
+    load_campaign_config,
+    verify_campaign_report,
+    write_campaign_config,
+)
+from .experiment_summary import ExperimentHealthConfig, ExperimentSummary, summarize_experiment, write_experiment_summary
 
 __all__ = [
     "Action",
@@ -126,6 +137,9 @@ __all__ = [
     "BotStatistics",
     "BET_SIZE_ACTIONS",
     "CallingStationBot",
+    "CampaignConfig",
+    "CampaignReport",
+    "CampaignVariant",
     "Deck",
     "EQUITY_OUTCOMES",
     "EvaluationConfig",
@@ -135,6 +149,8 @@ __all__ = [
     "ExperimentLedger",
     "ExperimentRunResult",
     "ExperimentRunner",
+    "ExperimentHealthConfig",
+    "ExperimentSummary",
     "EquityCalibrationBin",
     "EquityBackbonePretrainer",
     "EquityMetrics",
@@ -206,6 +222,7 @@ __all__ = [
     "TuningEvidence",
     "TracePretrainingDataset",
     "benchmark_hands",
+    "aggregate_campaign",
     "checkpoint_curriculum_metadata",
     "capture_equity_snapshot",
     "equity_cross_entropy",
@@ -217,6 +234,7 @@ __all__ = [
     "generate_pretraining_dataset",
     "generate_pretraining_corpus",
     "load_pretraining_corpus",
+    "load_campaign_config",
     "migrate_v2_checkpoint",
     "run_tournament",
     "run_sanity_checks",
@@ -246,5 +264,10 @@ __all__ = [
     "hu_promotion_protocol_payload",
     "materialize_sweep",
     "publish_tuning_evaluation",
+    "single_experiment_trial",
     "write_hu_promotion_protocol",
+    "summarize_experiment",
+    "verify_campaign_report",
+    "write_experiment_summary",
+    "write_campaign_config",
 ]

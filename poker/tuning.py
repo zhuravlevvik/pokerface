@@ -94,6 +94,7 @@ def hu_promotion_protocol_payload(training: TrainingRunConfig, promotion: Promot
         "paired_position_seeds": True,
         "ci_method": "paired_position_seed_block_normal_v1",
         "seed_start": promotion.seed_start,
+        "evaluation_run_seed": 0,
         "seed_blocks_per_opponent": promotion.hands_per_opponent // 2,
     }
     return {
@@ -348,6 +349,35 @@ def expand_sweep(config: SweepConfig) -> tuple[TrialSpec, ...]:
     """Convenience wrapper for callers that prefer a function API."""
 
     return config.expand_trials()
+
+
+def single_experiment_trial(experiment: ExperimentConfig) -> TrialSpec:
+    """Adapt one immutable experiment contract for the evidence workflow.
+
+    A standalone experiment is deliberately *not* a one-item sweep: it has no
+    mutable grid and therefore cannot be submitted to ``compare``.  It can,
+    however, use exactly the same checkpoint, ledger and fixed-promotion
+    validation as a materialized tuning trial.
+
+    ``ExperimentLedger`` persists ``ExperimentConfig.name`` as the public
+    tuning identity expected by the sealed report validator.  Keep that value
+    as ``trial_id`` rather than using ``ExperimentConfig.trial_id`` (the
+    ledger's internal hash-suffixed identifier).
+    """
+
+    if not isinstance(experiment, ExperimentConfig):
+        raise TypeError("experiment must be an ExperimentConfig")
+    return TrialSpec(
+        trial_id=experiment.name,
+        sweep_id=f"standalone-{experiment.config_sha256[:16]}",
+        seed=experiment.training.run.seed,
+        ppo_overrides=MappingProxyType({}),
+        config=experiment.training,
+        evaluation_protocol_sha256=experiment.evaluation_protocol_sha256,
+        evaluation_protocol_path=experiment.evaluation_protocol_path,
+        base_config_sha256=_sha256(experiment.training.to_dict()),
+        code_revision=experiment.code_revision,
+    )
 
 
 def load_sweep_config(path: str | Path) -> SweepConfig:
@@ -842,6 +872,7 @@ def _validate_promotion_evidence(
     decision = report.get("decision")
     suite = report.get("suite")
     run_context = candidate.get("run_context") if isinstance(candidate, Mapping) else None
+    expected_run_seed = expected_protocol.get("evaluation_run_seed")
     if (
         report.get("promotion_report_version") != PROMOTION_REPORT_VERSION
         or _canonical_json(report.get("promotion_config")) != _canonical_json(dict(promotion_config_data))
@@ -852,6 +883,7 @@ def _validate_promotion_evidence(
         or not isinstance(run_context, Mapping)
         or run_context.get("run_config_sha256") != trial.run_config_sha256
         or run_context.get("evaluation_protocol_sha256") != trial.evaluation_protocol_sha256
+        or run_context.get("evaluation_run_seed") != expected_run_seed
         or not isinstance(decision, Mapping)
         or not isinstance(decision.get("accepted"), bool)
         or not isinstance(decision.get("reasons"), list)
@@ -861,7 +893,9 @@ def _validate_promotion_evidence(
         or suite.get("schema_version") != "2.0"
     ):
         raise ValueError("promotion report does not match the completed trial and preregistered protocol")
-    evaluator = PromotionEvaluator(promotion_config, report_path.parent.parent, run_seed=trial.seed)
+    if isinstance(expected_run_seed, bool) or not isinstance(expected_run_seed, int) or expected_run_seed < 0:
+        raise ValueError("evaluation protocol has an invalid fixed evaluation RNG seed")
+    evaluator = PromotionEvaluator(promotion_config, report_path.parent.parent, run_seed=expected_run_seed)
     if evaluator.archive_manifest_path.resolve() != archive_manifest_path or not archive_manifest_path.is_file():
         raise ValueError("promotion archive manifest path does not match its evaluator")
     report_sha = _file_sha256(report_path)
@@ -879,6 +913,17 @@ def _validate_promotion_evidence(
     matchups = suite.get("matchups")
     if not isinstance(matchups, list):
         raise ValueError("promotion suite has malformed matchups")
+    opponents = report.get("opponents")
+    if not isinstance(opponents, list):
+        raise ValueError("promotion report has malformed opponent registry")
+    expected_bot_seed = expected_run_seed + promotion_config.seed_start
+    for opponent in opponents:
+        if not isinstance(opponent, Mapping) or not str(opponent.get("name", "")).startswith("baseline:"):
+            continue
+        baseline_name = str(opponent["name"]).split(":", 1)[1]
+        expected_seed = None if baseline_name in {"rule", "tight"} else expected_bot_seed
+        if opponent.get("seed") != expected_seed:
+            raise ValueError("promotion baseline RNG does not match the preregistered fixed evaluation seed")
     baselines = [item for item in matchups if isinstance(item, Mapping) and str(item.get("opponent", "")).startswith("baseline:")]
     if not baselines:
         raise ValueError("promotion suite has no baseline evidence")
@@ -1050,6 +1095,7 @@ __all__ = [
     "load_sweep_config",
     "materialize_sweep",
     "publish_tuning_evaluation",
+    "single_experiment_trial",
     "write_hu_promotion_protocol",
     "write_sweep_config",
 ]
