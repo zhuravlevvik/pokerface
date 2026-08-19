@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 pokerface-pretrain = "poker.pretrain_cli:main"
 pokerface-train = "poker.train_cli:main"
 pokerface-watch = "poker.watch:main"
+pokerface-curriculum = "poker.curriculum_cli:main"
 
 [project.optional-dependencies]
 rl = ["torch>=2.2"]

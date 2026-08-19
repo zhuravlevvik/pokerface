@@ -30,6 +30,7 @@
 14. [Предобучение equity/backbone](14_equity_pretraining.md)
 15. [Heads-up evaluation и promotion loop](15_hu_promotion_loop.md)
 16. [Автоматический переход curriculum A → B](16_curriculum_transition.md)
+17. [Парный transfer-vs-scratch curriculum A → E](17_paired_multiway_curriculum.md)
 
 Текущее состояние реализации и доказательства проверок: [release-readiness audit](12_release_readiness.md).
 

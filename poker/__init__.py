@@ -75,6 +75,24 @@ from .curriculum_transition import (
     TransitionEvaluation,
     TransitionEvidence,
 )
+from .multiway_evaluation import (
+    MultiwayEvaluationConfig,
+    MultiwayEvaluationReport,
+    OpponentSeat,
+    PairedMultiwayEvaluation,
+    evaluate_multiway_suite,
+    pair_multiway_reports,
+)
+from .paired_rung import PairedRungConfig, PairedRungResult, PairedRungRunner
+from .curriculum_coordinator import (
+    CurriculumCoordinator,
+    CurriculumCoordinatorConfig,
+    CurriculumTransitionDecision,
+    EvaluationProtocol,
+    OpponentSpec,
+    native_paired_rung_runner,
+)
+from .curriculum_runtime import CurriculumJobConfig, native_multiway_evaluator
 
 __all__ = [
     "Action",
@@ -178,4 +196,21 @@ __all__ = [
     "stage_spec",
     "transfer_checkpoint",
     "write_pretraining_corpus",
+    "CurriculumCoordinator",
+    "CurriculumCoordinatorConfig",
+    "CurriculumJobConfig",
+    "CurriculumTransitionDecision",
+    "EvaluationProtocol",
+    "MultiwayEvaluationConfig",
+    "MultiwayEvaluationReport",
+    "OpponentSeat",
+    "OpponentSpec",
+    "PairedMultiwayEvaluation",
+    "PairedRungConfig",
+    "PairedRungResult",
+    "PairedRungRunner",
+    "evaluate_multiway_suite",
+    "native_multiway_evaluator",
+    "native_paired_rung_runner",
+    "pair_multiway_reports",
 ]

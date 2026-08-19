@@ -28,16 +28,17 @@ E. 5-max: расширение стека и сайзингов при дока�
 
 ## Автоматизация переходов
 
-Сейчас реализован только opt-in A→B. Он требует explicit reference checkpoint,
-immutable evidence artifacts и не может быть включён вместе с HU promotion.
-Автоматический A→B запускается только при
-`require_transfer_beats_scratch=false`, потому что в нём пока нет честного
-paired scratch rung. Это ограничение evidence, а не разрешение считать
-transfer доказанно лучшим scratch.
+Встроенный в один training run opt-in A→B остаётся ограниченным legacy-
+контуром из [16_curriculum_transition.md](16_curriculum_transition.md). Для
+доказательного сравнения реализован отдельный coordinator
+[17_paired_multiway_curriculum.md](17_paired_multiway_curriculum.md): он
+поддерживает только соседние пары A→B→C→D→E, обучает transfer и scratch с
+одинаковым target-stage бюджетом и принимает ровно full checkpoint transfer.
 
-Переходы C--E пока не автоматизируются: multiway-корректная
-`expected_showdown_share` head уже есть, но ещё нужен настоящий
-transfer-vs-scratch rung при одинаковом бюджете и отдельный multiway gate.
+Multiway gate использует позиционно-ротированные heterogeneous tables,
+common-deal block CI и отдельную `expected_showdown_share` calibration по
+обязательным strata. Это делает переходы C--E исполняемыми, но не означает,
+что они уже пройдены реальной обученной моделью.
 
 ## Критерий приёмки
 
