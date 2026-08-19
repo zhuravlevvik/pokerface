@@ -141,3 +141,13 @@ Full training checkpoint совместим с inference loader. Запусти�
 
 После запуска открыть `http://127.0.0.1:8000`. Пути checkpoint'ов задаются
 только в operator-controlled CLI; браузер работает с безопасными catalog id.
+
+## Длительный trial и подбор параметров
+
+Для сравнительных запусков используйте `poker.experiment_cli`, а не
+invocation-only `--iterations` обычного train CLI. Experiment config фиксирует
+реальный budget, code revision и evaluation protocol, а hash-chain ledger
+сохраняет метрики каждой завершённой iteration. `poker.tuning_cli` создаёт
+детерминированную матрицу отдельных trials и сравнивает только завершённые
+hash-bound evaluation reports. Полный контракт и команды приведены в
+[18_experiment_ledger_and_tuning.md](18_experiment_ledger_and_tuning.md).

@@ -93,6 +93,21 @@ from .curriculum_coordinator import (
     native_paired_rung_runner,
 )
 from .curriculum_runtime import CurriculumJobConfig, native_multiway_evaluator
+from .experiments import ExperimentConfig, ExperimentEvent, ExperimentLedger
+from .experiment_runner import ExperimentRunResult, ExperimentRunner
+from .tuning import (
+    MaterializedTrial,
+    SweepConfig,
+    TrialSpec,
+    TuningComparisonReport,
+    TuningEvidence,
+    compare_tuning_evidence,
+    hu_promotion_protocol_payload,
+    materialize_sweep,
+    publish_tuning_evaluation,
+    write_hu_promotion_protocol,
+)
+from .releases import LineageArtifact, ReleaseRecord, ReleaseRegistry, ReleaseRequest
 
 __all__ = [
     "Action",
@@ -115,6 +130,11 @@ __all__ = [
     "EQUITY_OUTCOMES",
     "EvaluationConfig",
     "EvaluationSuiteReport",
+    "ExperimentConfig",
+    "ExperimentEvent",
+    "ExperimentLedger",
+    "ExperimentRunResult",
+    "ExperimentRunner",
     "EquityCalibrationBin",
     "EquityBackbonePretrainer",
     "EquityMetrics",
@@ -139,6 +159,8 @@ __all__ = [
     "ModelDiagnostics",
     "ModelOutput",
     "MatchupReport",
+    "MaterializedTrial",
+    "LineageArtifact",
     "PlayerState",
     "Pot",
     "PokerBot",
@@ -159,6 +181,9 @@ __all__ = [
     "RegressionCase",
     "RegressionControlSet",
     "RegressionResult",
+    "ReleaseRecord",
+    "ReleaseRegistry",
+    "ReleaseRequest",
     "RuleBot",
     "SimulationBenchmark",
     "SanityScenarioResult",
@@ -167,6 +192,7 @@ __all__ = [
     "StageEvaluation",
     "StageScheduler",
     "StageTransitionError",
+    "SweepConfig",
     "AcceptanceConfig",
     "CorpusConfig",
     "SeedRange",
@@ -175,6 +201,9 @@ __all__ = [
     "TransitionEvaluation",
     "TransitionEvidence",
     "TournamentResult",
+    "TrialSpec",
+    "TuningComparisonReport",
+    "TuningEvidence",
     "TracePretrainingDataset",
     "benchmark_hands",
     "checkpoint_curriculum_metadata",
@@ -213,4 +242,9 @@ __all__ = [
     "native_multiway_evaluator",
     "native_paired_rung_runner",
     "pair_multiway_reports",
+    "compare_tuning_evidence",
+    "hu_promotion_protocol_payload",
+    "materialize_sweep",
+    "publish_tuning_evaluation",
+    "write_hu_promotion_protocol",
 ]
