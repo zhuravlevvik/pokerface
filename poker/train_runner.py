@@ -25,7 +25,15 @@ from .curriculum_transition import CurriculumTransitionConfig, CurriculumTransit
 from .league import BotPolicy, LeagueMember, ModelPolicy, OpponentLeague
 from .model import ModelConfig, TORCH_AVAILABLE, PokerAgentModel
 from .promotion import PromotionConfig, PromotionEvaluation, PromotionEvaluator
-from .training import PPOConfig, PPOTrainer, UpdateMetrics
+from .training import (
+    NonFiniteTrainingError,
+    PPOConfig,
+    PPOTrainer,
+    UpdateMetrics,
+    ensure_finite_model_parameters,
+    ensure_finite_optimizer_state,
+    ensure_finite_update_metrics,
+)
 
 if TORCH_AVAILABLE:
     import torch
@@ -566,6 +574,11 @@ class TrainingRunner:
         self._stop_requested = False
         self._last_checkpoint_time = time.monotonic()
         self._last_checkpoint_decisions = 0
+        self._last_update_metrics: UpdateMetrics | None = None
+        self._checkpoint_observer: Callable[[Path, UpdateMetrics | None], None] | None = None
+        self._last_published_checkpoint_iteration: int | None = None
+        self._last_published_checkpoint_path: Path | None = None
+        self._nonfinite_failure: str | None = None
 
     def _apply_stage_learning_rate(self) -> float:
         """Apply the curriculum multiplier to PPO's configured base LR."""
@@ -657,6 +670,23 @@ class TrainingRunner:
     def save_checkpoint(self, *, reason: str = "periodic", metrics: UpdateMetrics | None = None) -> Path:
         """Atomically publish an immutable checkpoint and atomically refresh latest."""
 
+        if self._nonfinite_failure is not None:
+            raise NonFiniteTrainingError(
+                "this runner observed non-finite training state and cannot publish; "
+                "resume from the last durable checkpoint"
+            ) from None
+        effective_metrics = metrics if metrics is not None else self._last_update_metrics
+        # Health gates must run before changing the in-memory manifest or
+        # touching either durable checkpoint.  A bad update remains invisible
+        # to future resume attempts and cannot replace ``latest``.
+        try:
+            ensure_finite_model_parameters(self.model)
+            ensure_finite_optimizer_state(self.trainer.optimizer)
+            if effective_metrics is not None:
+                ensure_finite_update_metrics(effective_metrics)
+        except NonFiniteTrainingError as error:
+            self._nonfinite_failure = str(error)
+            raise
         tag = f"{reason}_{self.iteration:08d}.pt"
         path = self.checkpoint_directory / tag
         records = self.manifest.setdefault("checkpoints", [])
@@ -668,7 +698,7 @@ class TrainingRunner:
         self.manifest["latest"] = str(self.latest_path)
         self.manifest["updated_at"] = time.time()
         self._last_checkpoint_decisions = self.global_decisions
-        payload = self._checkpoint_payload(reason=reason, metrics=metrics)
+        payload = self._checkpoint_payload(reason=reason, metrics=effective_metrics)
         _atomic_torch_save(payload, path)
         # ``latest`` is a full independently-written file instead of a mutable
         # symlink: this works across platforms and readers never observe a
@@ -676,6 +706,11 @@ class TrainingRunner:
         _atomic_torch_save(payload, self.latest_path)
         _atomic_write_text(self.manifest_path, json.dumps(self.manifest, indent=2, sort_keys=True) + "\n")
         self._last_checkpoint_time = time.monotonic()
+        self._last_update_metrics = effective_metrics
+        self._last_published_checkpoint_iteration = self.iteration
+        self._last_published_checkpoint_path = path
+        if self._checkpoint_observer is not None:
+            self._checkpoint_observer(path, effective_metrics)
         return path
 
     @classmethod
@@ -719,6 +754,11 @@ class TrainingRunner:
             raise ValueError("checkpoint has no optimizer state")
         instance.trainer.optimizer.load_state_dict(optimizer_state)
         instance._apply_stage_learning_rate()
+        try:
+            ensure_finite_model_parameters(instance.model)
+            ensure_finite_optimizer_state(instance.trainer.optimizer)
+        except NonFiniteTrainingError as error:
+            raise ValueError("checkpoint contains non-finite trainable state") from error
         for name in ("iteration", "global_decisions", "global_hands", "seed_counter"):
             if not isinstance(progress.get(name), int) or progress[name] < 0:
                 raise ValueError(f"checkpoint has invalid progress field {name!r}")
@@ -877,6 +917,21 @@ class TrainingRunner:
         if not isinstance(last_checkpoint_decisions, int) or not 0 <= last_checkpoint_decisions <= instance.global_decisions:
             raise ValueError("checkpoint has invalid last checkpoint decision count")
         instance._last_checkpoint_decisions = last_checkpoint_decisions
+        metrics_data = payload.get("metrics")
+        if metrics_data is None:
+            instance._last_update_metrics = None
+        elif isinstance(metrics_data, Mapping):
+            try:
+                instance._last_update_metrics = UpdateMetrics(**dict(metrics_data))
+            except (TypeError, ValueError) as error:
+                raise ValueError("checkpoint has invalid training metrics") from error
+            ensure_finite_update_metrics(instance._last_update_metrics)
+        else:
+            raise ValueError("checkpoint has invalid training metrics")
+        instance._checkpoint_observer = None
+        instance._last_published_checkpoint_iteration = instance.iteration
+        instance._last_published_checkpoint_path = checkpoint_path
+        instance._nonfinite_failure = None
         # Construction of model/snapshots itself consumes RNG.  Restore last,
         # then the next rollout/update is bit-for-bit on the original stream.
         _restore_rng_state(rng)
@@ -1018,21 +1073,38 @@ class TrainingRunner:
 
     def _train_one_iteration(self) -> UpdateMetrics:
         spec = self.scheduler.spec
-        rollout, metrics = self.trainer.train_iteration(
-            self.config.run.hands_per_iteration,
-            table_count=self.config.run.table_count,
-            player_count=spec.player_count,
-            starting_stack=spec.starting_stack_chips(variant_index=self.iteration),
-            allowed_raise_actions=spec.allowed_raise_actions,
-            should_stop=lambda: self._stop_requested,
-        )
+        try:
+            rollout, metrics = self.trainer.train_iteration(
+                self.config.run.hands_per_iteration,
+                table_count=self.config.run.table_count,
+                player_count=spec.player_count,
+                starting_stack=spec.starting_stack_chips(variant_index=self.iteration),
+                allowed_raise_actions=spec.allowed_raise_actions,
+                should_stop=lambda: self._stop_requested,
+            )
+            # A failed health check is intentionally before every
+            # durable-progress mutation.  The caller can restart from the
+            # previous full checkpoint.
+            ensure_finite_update_metrics(metrics)
+            ensure_finite_model_parameters(self.model)
+            ensure_finite_optimizer_state(self.trainer.optimizer)
+        except NonFiniteTrainingError as error:
+            self._nonfinite_failure = str(error)
+            raise
         self.iteration += 1
         self.global_decisions += rollout.decisions
         self.global_hands += rollout.hands
         self.manifest["last_metrics"] = asdict(metrics)
+        self._last_update_metrics = metrics
         return metrics
 
-    def run(self, *, until_iteration: int | None = None, install_signal_handlers: bool = True) -> TrainingRunResult:
+    def run(
+        self,
+        *,
+        until_iteration: int | None = None,
+        install_signal_handlers: bool = True,
+        checkpoint_observer: Callable[[Path, UpdateMetrics | None], None] | None = None,
+    ) -> TrainingRunResult:
         """Train to the target iteration and save only complete-update states.
 
         The first SIGINT requests an orderly checkpoint at the next safe
@@ -1043,7 +1115,11 @@ class TrainingRunner:
         target = self.config.run.iterations if until_iteration is None else until_iteration
         if target < self.iteration:
             raise ValueError("target iteration precedes the restored run")
+        if checkpoint_observer is not None and not callable(checkpoint_observer):
+            raise TypeError("checkpoint_observer must be callable or null")
         old_handler = None
+        old_observer = self._checkpoint_observer
+        self._checkpoint_observer = checkpoint_observer
         signal_count = 0
 
         def on_interrupt(_signum: int, _frame: Any) -> None:
@@ -1131,9 +1207,19 @@ class TrainingRunner:
                 if self._stop_requested:
                     path = self.save_checkpoint(reason="interrupt")
                     return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, True, path)
-            path = self.save_checkpoint(reason="complete")
+            # A periodic/promotion checkpoint may already have published this
+            # exact complete-update boundary.  Do not notify observers twice
+            # or write a second competing full checkpoint at that iteration.
+            if (
+                self._last_published_checkpoint_iteration == self.iteration
+                and self._last_published_checkpoint_path is not None
+            ):
+                path = self._last_published_checkpoint_path
+            else:
+                path = self.save_checkpoint(reason="complete", metrics=self._last_update_metrics)
             return TrainingRunResult(self.iteration, self.global_decisions, self.global_hands, False, path)
         finally:
+            self._checkpoint_observer = old_observer
             if old_handler is not None:
                 signal.signal(signal.SIGINT, old_handler)
 

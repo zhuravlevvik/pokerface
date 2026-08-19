@@ -37,6 +37,10 @@ def _require_torch() -> None:
         raise RuntimeError("PyTorch is required for poker.training; install the project with `.[rl]`.")
 
 
+class NonFiniteTrainingError(RuntimeError):
+    """Training health failed; callers must not publish the current state."""
+
+
 @dataclass(frozen=True)
 class PPOConfig:
     """Conservative hyperparameters for the first self-play implementation."""
@@ -122,6 +126,52 @@ class UpdateMetrics:
     approximate_kl: float
     clip_fraction: float
     expected_showdown_share_loss: float = 0.0
+    gradient_norm: float = 0.0
+
+
+def ensure_finite_update_metrics(metrics: UpdateMetrics) -> None:
+    """Reject a metric envelope before it can be checkpointed or reported."""
+
+    if not isinstance(metrics.samples, int) or isinstance(metrics.samples, bool) or metrics.samples < 0:
+        raise NonFiniteTrainingError("training metric samples must be a non-negative integer")
+    for name in (
+        "total_loss",
+        "policy_loss",
+        "value_loss",
+        "equity_loss",
+        "entropy",
+        "approximate_kl",
+        "clip_fraction",
+        "expected_showdown_share_loss",
+        "gradient_norm",
+    ):
+        value = getattr(metrics, name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(float(value)):
+            raise NonFiniteTrainingError(f"training metric {name} is non-finite")
+
+
+def ensure_finite_model_parameters(model: PokerAgentModel) -> None:
+    """Ensure an optimiser step did not poison a checkpointable model."""
+
+    _require_torch()
+    for name, parameter in model.named_parameters():
+        if not bool(torch.isfinite(parameter).all()):
+            raise NonFiniteTrainingError(f"model parameter {name} is non-finite")
+
+
+def ensure_finite_optimizer_state(optimizer: object) -> None:
+    """Fail closed when an optimizer tensor contains NaN or infinity."""
+
+    _require_torch()
+    state = getattr(optimizer, "state", None)
+    if not isinstance(state, Mapping):
+        raise NonFiniteTrainingError("optimizer state is unavailable")
+    for parameter_state in state.values():
+        if not isinstance(parameter_state, Mapping):
+            raise NonFiniteTrainingError("optimizer parameter state is malformed")
+        for name, value in parameter_state.items():
+            if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all()):
+                raise NonFiniteTrainingError(f"optimizer state {name!r} is non-finite")
 
 
 def factorized_logprob_and_entropy(output, action_indices: Tensor, bet_size_indices: Tensor) -> tuple[Tensor, Tensor]:
@@ -382,7 +432,17 @@ class PPOTrainer:
             dtype=torch.float32,
             device=self.device,
         )
-        totals = {"total": 0.0, "policy": 0.0, "value": 0.0, "equity": 0.0, "share": 0.0, "entropy": 0.0, "kl": 0.0, "clip": 0.0}
+        totals = {
+            "total": 0.0,
+            "policy": 0.0,
+            "value": 0.0,
+            "equity": 0.0,
+            "share": 0.0,
+            "entropy": 0.0,
+            "kl": 0.0,
+            "clip": 0.0,
+            "grad_norm": 0.0,
+        }
         updates = 0
         count = len(rollout.steps)
         for _ in range(self.config.epochs):
@@ -407,10 +467,24 @@ class PPOTrainer:
                     + self.config.expected_showdown_share_coefficient * expected_share_loss
                     - self.config.entropy_coefficient * entropy.mean()
                 )
+                for name, value in (
+                    ("policy_loss", policy_loss),
+                    ("value_loss", value_loss),
+                    ("equity_loss", equity_loss),
+                    ("expected_showdown_share_loss", expected_share_loss),
+                    ("entropy", entropy.mean()),
+                    ("total_loss", total_loss),
+                ):
+                    if not bool(torch.isfinite(value).all()):
+                        raise NonFiniteTrainingError(f"PPO {name} is non-finite")
                 self.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                if not bool(torch.isfinite(gradient_norm).all()):
+                    raise NonFiniteTrainingError("PPO gradient norm is non-finite")
                 self.optimizer.step()
+                ensure_finite_model_parameters(self.model)
+                ensure_finite_optimizer_state(self.optimizer)
                 with torch.no_grad():
                     totals["total"] += float(total_loss.item())
                     totals["policy"] += float(policy_loss.item())
@@ -420,8 +494,9 @@ class PPOTrainer:
                     totals["entropy"] += float(entropy.mean().item())
                     totals["kl"] += float((old_logprobs[indices] - new_logprobs).mean().item())
                     totals["clip"] += float(((ratio - 1.0).abs() > self.config.clip_ratio).float().mean().item())
+                    totals["grad_norm"] += float(gradient_norm.item())
                 updates += 1
-        return UpdateMetrics(
+        metrics = UpdateMetrics(
             samples=count,
             total_loss=totals["total"] / updates,
             policy_loss=totals["policy"] / updates,
@@ -431,7 +506,10 @@ class PPOTrainer:
             approximate_kl=totals["kl"] / updates,
             clip_fraction=totals["clip"] / updates,
             expected_showdown_share_loss=totals["share"] / updates,
+            gradient_norm=totals["grad_norm"] / updates,
         )
+        ensure_finite_update_metrics(metrics)
+        return metrics
 
     def train_iteration(self, hand_count: int, **rollout_kwargs: Any) -> tuple[Rollout, UpdateMetrics]:
         rollout = self.collect_rollout(hand_count, **rollout_kwargs)
@@ -453,11 +531,15 @@ class PPOTrainer:
 
 
 __all__ = [
+    "NonFiniteTrainingError",
     "PPOConfig",
     "PPOTrainer",
     "Rollout",
     "RolloutStep",
     "UpdateMetrics",
     "compute_gae",
+    "ensure_finite_model_parameters",
+    "ensure_finite_optimizer_state",
+    "ensure_finite_update_metrics",
     "factorized_logprob_and_entropy",
 ]

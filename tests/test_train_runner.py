@@ -17,7 +17,7 @@ from poker.observation import observation_for
 from poker.pretraining import EquityBackbonePretrainer, PretrainingConfig
 from poker.promotion import PromotionConfig
 from poker.train_runner import RunSettings, TrainingRunConfig, TrainingRunner
-from poker.training import PPOConfig, PPOTrainer, UpdateMetrics
+from poker.training import NonFiniteTrainingError, PPOConfig, PPOTrainer, Rollout, UpdateMetrics
 
 pytestmark = pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed; install with .[rl]")
 
@@ -209,6 +209,59 @@ def test_requested_graceful_stop_writes_interrupt_checkpoint_at_safe_boundary(tm
     payload = torch.load(result.checkpoint_path, map_location="cpu", weights_only=True)
     assert payload["reason"] == "interrupt"
     assert TrainingRunner.resume(runner.latest_path).iteration == 1
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_nonfinite_iteration_does_not_advance_or_replace_latest(tmp_path, monkeypatch, bad_value) -> None:
+    runner = TrainingRunner(_config(iterations=1), tmp_path / "run")
+    runner.save_checkpoint(reason="baseline")
+    latest_before = runner.latest_path.read_bytes()
+    manifest_before = json.loads(json.dumps(runner.manifest))
+    bad_metrics = UpdateMetrics(0, bad_value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    monkeypatch.setattr(runner.trainer, "train_iteration", lambda *_args, **_kwargs: (Rollout((), 0), bad_metrics))
+
+    with pytest.raises(NonFiniteTrainingError, match="total_loss"):
+        runner._train_one_iteration()
+    assert (runner.iteration, runner.global_decisions, runner.global_hands) == (0, 0, 0)
+    assert runner.latest_path.read_bytes() == latest_before
+    assert runner.manifest == manifest_before
+    with pytest.raises(NonFiniteTrainingError, match="cannot publish"):
+        runner.save_checkpoint(reason="after_failure")
+    assert runner.latest_path.read_bytes() == latest_before
+
+
+def test_nonfinite_model_cannot_replace_latest_checkpoint(tmp_path) -> None:
+    runner = TrainingRunner(_config(iterations=1), tmp_path / "run")
+    runner.save_checkpoint(reason="baseline")
+    latest_before = runner.latest_path.read_bytes()
+    manifest_before = json.loads(json.dumps(runner.manifest))
+    with torch.no_grad():
+        next(runner.model.parameters()).view(-1)[0] = float("nan")
+
+    with pytest.raises(NonFiniteTrainingError, match="model parameter"):
+        runner.save_checkpoint(reason="periodic")
+    assert runner.latest_path.read_bytes() == latest_before
+    assert runner.manifest == manifest_before
+
+
+def test_checkpoint_observer_sees_published_periodic_checkpoint_once_and_final_metrics(tmp_path) -> None:
+    runner = TrainingRunner(_config(iterations=1), tmp_path / "run")
+    observed: list[tuple[object, UpdateMetrics | None]] = []
+
+    def observer(path, metrics) -> None:
+        assert path.exists()
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        assert payload["metrics"] == runner.manifest["last_metrics"]
+        observed.append((path, metrics))
+
+    result = runner.run(install_signal_handlers=False, checkpoint_observer=observer)
+    assert result.checkpoint_path == observed[0][0]
+    assert len(observed) == 1
+    assert observed[0][1] is not None
+    assert observed[0][1] == runner._last_update_metrics
+    payload = torch.load(result.checkpoint_path, map_location="cpu", weights_only=True)
+    assert payload["reason"] == "periodic"
+    assert payload["metrics"] == runner.manifest["last_metrics"]
 
 
 def test_real_first_and_second_sigint_follow_graceful_then_immediate_semantics(tmp_path, monkeypatch) -> None:

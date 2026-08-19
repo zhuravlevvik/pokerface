@@ -13,6 +13,9 @@ pokerface-pretrain = "poker.pretrain_cli:main"
 pokerface-train = "poker.train_cli:main"
 pokerface-watch = "poker.watch:main"
 pokerface-curriculum = "poker.curriculum_cli:main"
+pokerface-experiment = "poker.experiment_cli:main"
+pokerface-tune = "poker.tuning_cli:main"
+pokerface-release = "poker.release_cli:main"
 
 [project.optional-dependencies]
 rl = ["torch>=2.2"]

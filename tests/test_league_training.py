@@ -7,7 +7,16 @@ import pytest
 from poker.betting import Action
 from poker.league import CheckpointArchive, LeagueMember, ModelPolicy, OpponentLeague, default_league
 from poker.model import ModelConfig, TORCH_AVAILABLE, PokerAgentModel
-from poker.training import PPOConfig, PPOTrainer, RolloutStep, compute_gae, factorized_logprob_and_entropy
+from poker.training import (
+    NonFiniteTrainingError,
+    PPOConfig,
+    PPOTrainer,
+    RolloutStep,
+    compute_gae,
+    ensure_finite_model_parameters,
+    ensure_finite_optimizer_state,
+    factorized_logprob_and_entropy,
+)
 
 pytestmark = pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed; install with .[rl]")
 
@@ -120,3 +129,55 @@ def test_train_iteration_extends_an_empty_rollout_to_a_current_policy_decision(m
     assert rollout.hands == 2
     assert rollout.decisions > 0
     assert metrics.samples == rollout.decisions
+
+
+def test_ppo_rejects_nan_loss_before_optimizer_step(monkeypatch) -> None:
+    model = _model()
+    trainer = PPOTrainer(model, default_league(model, seed=19), PPOConfig(epochs=1, minibatch_size=8, equity_samples=1))
+    rollout = trainer.collect_rollout(2, table_count=2, player_count=2)
+    before = [parameter.detach().clone() for parameter in model.parameters()]
+
+    import poker.training as training_module
+
+    monkeypatch.setattr(
+        training_module.F,
+        "mse_loss",
+        lambda value, _target: value.sum() * float("nan"),
+    )
+    with pytest.raises(NonFiniteTrainingError, match="value_loss"):
+        trainer.update(rollout)
+    assert all(torch.equal(parameter, saved) for parameter, saved in zip(model.parameters(), before, strict=True))
+
+
+def test_ppo_rejects_infinite_gradient_norm_before_optimizer_step(monkeypatch) -> None:
+    model = _model()
+    trainer = PPOTrainer(model, default_league(model, seed=23), PPOConfig(epochs=1, minibatch_size=8, equity_samples=1))
+    rollout = trainer.collect_rollout(2, table_count=2, player_count=2)
+    before = [parameter.detach().clone() for parameter in model.parameters()]
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", lambda *_args, **_kwargs: torch.tensor(float("inf")))
+    with pytest.raises(NonFiniteTrainingError, match="gradient norm"):
+        trainer.update(rollout)
+    assert all(torch.equal(parameter, saved) for parameter, saved in zip(model.parameters(), before, strict=True))
+
+
+def test_model_parameter_health_rejects_nonfinite_weights() -> None:
+    model = _model()
+    first = next(model.parameters())
+    with torch.no_grad():
+        first.view(-1)[0] = float("nan")
+    with pytest.raises(NonFiniteTrainingError, match="model parameter"):
+        ensure_finite_model_parameters(model)
+
+
+def test_optimizer_health_rejects_nonfinite_momentum() -> None:
+    model = _model()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss = sum(parameter.sum() for parameter in model.parameters())
+    loss.backward()
+    optimizer.step()
+    first_state = next(iter(optimizer.state.values()))
+    first_state["exp_avg"].view(-1)[0] = float("nan")
+
+    with pytest.raises(NonFiniteTrainingError, match="optimizer state"):
+        ensure_finite_optimizer_state(optimizer)
