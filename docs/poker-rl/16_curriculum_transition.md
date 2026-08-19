@@ -9,10 +9,12 @@ Stage A (сокращённые сайзинги) к Stage B (полный на�
 
 Автоматизация Stage C--E намеренно заблокирована. Для неё сначала нужны:
 
-1. корректная multiway expected-share head/метка; текущие `win/tie/loss` и
-   `win + 0.5 × tie` не являются expected pot share в multiway;
-2. настоящий парный scratch rung с тем же бюджетом, seed'ами и протоколом,
+1. настоящий парный scratch rung с тем же бюджетом, seed'ами и протоколом,
    что и transfer. Автомат A→B такой rung не создаёт.
+
+Отдельная multiway-корректная `expected_showdown_share` head уже реализована,
+но сама по себе не доказывает качество transfer и не снимает scratch-rung
+блокировку C--E.
 
 ## Конфигурация и запуск
 
@@ -122,7 +124,7 @@ transfer artifact с согласованными hash'ами. Evidence вклю
 
 - положительный/заданный baseline результат с требуемой нижней границей CI;
 - prior/reference matchup и его CI;
-- HU equity calibration, sanity scenarios и ноль illegal actions;
+- expected-showdown-share calibration, sanity scenarios и ноль illegal actions;
 - `StageEvaluation`, совместимую с `CurriculumConfig` при явно отключённом
   scratch-сравнении.
 

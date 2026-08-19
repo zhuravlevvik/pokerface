@@ -85,6 +85,10 @@ def test_transition_freezes_evaluates_transfers_and_reloads_idempotently(tmp_pat
     assert transfer_metadata["stage"] == "B"
     assert transfer_metadata["parent_checkpoint"] == str(first.frozen_source_path)
     assert first.frozen_source_path.exists()
+    report = json.loads(first.report_path.read_text(encoding="utf-8"))
+    assert report["transition_report_version"] == 2
+    assert report["scalar_metric_protocol"] == "active_hands_expected_showdown_share_v1"
+    assert report["suite"]["schema_version"] == "2.0"
     assert evaluator.last_evaluated_iteration == 1
     assert evaluator.last_accepted_decision is not None
 
@@ -97,6 +101,7 @@ def test_transition_freezes_evaluates_transfers_and_reloads_idempotently(tmp_pat
         run_context=_run_context(config),
     )
     manifest = json.loads(restored.archive_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["version"] == 2
     assert second == first
     assert len(manifest["decisions"]) == 1
     assert not list((tmp_path / "run" / "curriculum-transitions").rglob(".*.tmp"))

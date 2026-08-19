@@ -77,10 +77,12 @@ def test_smoke_self_play_collects_labels_and_updates_all_heads() -> None:
     assert rollout.hands == 2
     assert rollout.decisions > 0
     assert all(step.equity_target is not None for step in rollout.steps)
+    assert all(step.expected_showdown_share_target is not None for step in rollout.steps)
     assert all(step.action_index in range(4) for step in rollout.steps)
     assert metrics.samples == rollout.decisions
     assert metrics.value_loss >= 0
     assert metrics.equity_loss >= 0
+    assert metrics.expected_showdown_share_loss >= 0
     assert metrics.entropy > 0
 
 

@@ -21,7 +21,12 @@ Game server общается с клиентом через WebSocket: это п
 {
   "action_probabilities": {"fold": 0.12, "call": 0.38, "raise": 0.50},
   "bet_size_probabilities": {"half_pot": 0.46, "pot": 0.31, "all_in": 0.05},
-  "equity": {"win": 0.61, "tie": 0.03, "loss": 0.36, "total": 0.625},
+  "equity": {"win": 0.61, "tie": 0.03, "loss": 0.36},
+  "scalar_metric": {
+    "name": "expected_showdown_share",
+    "value": 0.58,
+    "protocol": "active_hands_expected_showdown_share_v1"
+  },
   "value_bb": 3.7
 }
 ```
@@ -30,7 +35,7 @@ Game server общается с клиентом через WebSocket: это п
 
 - стол, позиции, стеки, банк, карты и текущий ход;
 - история действий и выбранный рейз-сайзинг;
-- текущая equity и график её изменения: preflop → flop → turn → river;
+- expected showdown share и график её изменения: preflop → flop → turn → river;
 - распределение действий и value в BB;
 - режим игрока (без чужих карт) и режим наблюдателя (раскрытие после окончания раздачи);
 - импорт и воспроизведение replay.
@@ -67,6 +72,12 @@ poker.web           optional FastAPI HTTP/WebSocket adapter + static browser UI
 силы руки. Для реальной модели создайте `GameServer` с
 `CheckpointInferenceService.from_checkpoint(path)` и передайте его в
 `create_app`; сервис читает checkpoint, но никогда его не меняет.
+
+Для baseline-бота `scalar_metric` имеет другое имя и протокол
+`heuristic_hand_strength_v1`: UI явно помечает его как proxy. Replay хранит
+типизированные точки `{metric, value, protocol, ...}`. Старые нетипизированные
+точки не содержат provenance (бот это или checkpoint), поэтому отвергаются
+fail-closed и должны быть явно мигрированы владельцем данных.
 
 В player-mode чужие карты не отправляются ни во время, ни после раздачи.
 Spectator-mode раскрывает все карты только в terminal snapshot. Оба replay

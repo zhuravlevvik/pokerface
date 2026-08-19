@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from .curriculum import CurriculumStage, stage_spec
-from .equity import EquityMetrics, equity_metrics
+from .equity import equity_metrics, expected_showdown_share_metrics
 from .model import ModelConfig, TORCH_AVAILABLE, PokerAgentModel
 from .pretraining import EquityBackbonePretrainer, PretrainingConfig, PretrainingMetrics
 from .pretraining_data import (
@@ -37,7 +37,7 @@ if TORCH_AVAILABLE:
     import torch
 
 
-PRETRAINING_RUN_VERSION = 1
+PRETRAINING_RUN_VERSION = 2
 
 
 def _require_torch() -> None:
@@ -72,9 +72,9 @@ class CorpusConfig:
             raise ValueError("train and holdout seed ranges must be disjoint")
         if not self.bot_mix or any(name not in BASELINE_BOT_NAMES for name in self.bot_mix):
             raise ValueError("bot_mix contains an unsupported baseline bot")
-        # The categorical target itself remains meaningful in multiway, but
-        # current calibration reduces it to win + 0.5*tie.  That scalar is a
-        # pot-share proxy only in heads-up, so executable Stage 1 runs stay HU.
+        # Stage 1 is deliberately a small heads-up warm-up.  The explicit
+        # expected-showdown-share label is multiway-correct, but widening the
+        # corpus belongs to later curriculum stages rather than this runner.
         if stage_spec(self.stage).player_count != 2:
             raise ValueError("Stage 1 pretraining runner currently supports heads-up stages A/B only")
 
@@ -231,21 +231,19 @@ def _mean_target(records: Sequence[Any]) -> tuple[float, float, float]:
     return tuple(sum(row[index] for row in targets) / len(targets) for index in range(3))  # type: ignore[return-value]
 
 
-def _brier_reduction(model: EquityMetrics, baseline: EquityMetrics) -> float:
+def _share_targets(records: Sequence[Any]) -> list[float]:
+    return [float(record.example.expected_showdown_share_target) for record in records]
+
+
+def _mean_share(records: Sequence[Any]) -> float:
+    targets = _share_targets(records)
+    if not targets:
+        raise ValueError("cannot calculate an empirical prior from an empty split")
+    return sum(targets) / len(targets)
+
+
+def _brier_reduction(model: Any, baseline: Any) -> float:
     return 1.0 - model.brier_score / max(baseline.brier_score, 1e-12)
-
-
-def _scalar_error(predictions: Sequence[Sequence[float]], targets: Sequence[Sequence[float]]) -> dict[str, float]:
-    if not predictions or len(predictions) != len(targets):
-        raise ValueError("scalar equity rows must be non-empty and aligned")
-    errors = [
-        (float(prediction[0]) + 0.5 * float(prediction[1])) - (float(target[0]) + 0.5 * float(target[1]))
-        for prediction, target in zip(predictions, targets, strict=True)
-    ]
-    return {
-        "mae": sum(abs(error) for error in errors) / len(errors),
-        "rmse": (sum(error * error for error in errors) / len(errors)) ** 0.5,
-    }
 
 
 def _label_quality(records: Sequence[Any]) -> dict[str, Any]:
@@ -362,42 +360,56 @@ class PretrainingRunner:
         overall_targets = _target_rows(self.corpus.holdout)
         overall_baseline = equity_metrics([overall_prior] * len(overall_targets), overall_targets, bins=self.config.training.calibration_bins)
         aggregate_reduction = _brier_reduction(validation.equity, overall_baseline)
-        aggregate_scalar = _scalar_error(validation.predictions, overall_targets)
-        aggregate_baseline_scalar = _scalar_error([overall_prior] * len(overall_targets), overall_targets)
+        overall_share_targets = _share_targets(self.corpus.holdout)
+        overall_share_prior = _mean_share(self.corpus.train)
+        aggregate_baseline_share = expected_showdown_share_metrics(
+            [overall_share_prior] * len(overall_share_targets),
+            overall_share_targets,
+            bins=self.config.training.calibration_bins,
+        )
+        aggregate_share_reduction = _brier_reduction(
+            validation.expected_showdown_share,
+            aggregate_baseline_share,
+        )
         strata: dict[str, Any] = {}
         supported_passes: list[bool] = []
-        indices_by_group: dict[str, list[int]] = {}
-        for index, record in enumerate(self.corpus.holdout):
-            indices_by_group.setdefault(_group_key(record.example), []).append(index)
         for key, records in sorted(holdout_groups.items()):
             prior = _mean_target(train_groups.get(key, self.corpus.train))
             targets = _target_rows(records)
             baseline = equity_metrics([prior] * len(targets), targets, bins=self.config.training.calibration_bins)
             model_metrics = validation.breakdowns["context"][key]
-            predictions = [validation.predictions[index] for index in indices_by_group[key]]
             reduction = _brier_reduction(model_metrics, baseline)
-            scalar = _scalar_error(predictions, targets)
+            share_targets = _share_targets(records)
+            share_prior = _mean_share(train_groups.get(key, self.corpus.train))
+            share_metrics = validation.expected_showdown_share_breakdowns["context"][key]
+            share_baseline = expected_showdown_share_metrics(
+                [share_prior] * len(share_targets),
+                share_targets,
+                bins=self.config.training.calibration_bins,
+            )
+            share_reduction = _brier_reduction(share_metrics, share_baseline)
             supported = len(records) >= self.config.acceptance.minimum_stratum_samples
             if supported:
                 supported_passes.append(
-                    reduction >= self.config.acceptance.minimum_brier_reduction
-                    and model_metrics.expected_calibration_error <= self.config.acceptance.maximum_ece
-                    and scalar["mae"] <= self.config.acceptance.maximum_scalar_mae
+                    share_reduction >= self.config.acceptance.minimum_brier_reduction
+                    and share_metrics.expected_calibration_error <= self.config.acceptance.maximum_ece
+                    and share_metrics.mean_absolute_error <= self.config.acceptance.maximum_scalar_mae
                 )
             strata[key] = {
                 "support": len(records),
                 "supported": supported,
-                "model": model_metrics.as_dict(),
-                "heads_up_scalar": scalar,
-                "empirical_prior": baseline.as_dict(),
-                "empirical_prior_heads_up_scalar": _scalar_error([prior] * len(targets), targets),
-                "brier_reduction": reduction,
+                "outcome_model": model_metrics.as_dict(),
+                "expected_showdown_share": share_metrics.as_dict(),
+                "outcome_empirical_prior": baseline.as_dict(),
+                "expected_showdown_share_empirical_prior": share_baseline.as_dict(),
+                "outcome_brier_reduction": reduction,
+                "expected_showdown_share_brier_reduction": share_reduction,
             }
 
         acceptance_passed = (
-            validation.equity.expected_calibration_error <= self.config.acceptance.maximum_ece
-            and aggregate_scalar["mae"] <= self.config.acceptance.maximum_scalar_mae
-            and aggregate_reduction >= self.config.acceptance.minimum_brier_reduction
+            validation.expected_showdown_share.expected_calibration_error <= self.config.acceptance.maximum_ece
+            and validation.expected_showdown_share.mean_absolute_error <= self.config.acceptance.maximum_scalar_mae
+            and aggregate_share_reduction >= self.config.acceptance.minimum_brier_reduction
             and len(supported_passes) >= self.config.acceptance.minimum_supported_strata
             and all(supported_passes)
         )
@@ -411,18 +423,23 @@ class PretrainingRunner:
             "run_config_sha256": self.config_sha256,
             "label_protocol": EQUITY_LABEL_PROTOCOL,
             "target_semantics": "fixed-deal virtual showdown; not public-range equity",
-            "scalar_equity_semantics": "win + 0.5 * tie (heads-up only)",
+            "scalar_metric": {
+                "name": "expected_showdown_share",
+                "protocol": "active_hands_expected_showdown_share_v1",
+                "semantics": "mean fractional share among active best hands at fixed-deal virtual showdown",
+            },
             "label_quality": {
                 "train": _label_quality(self.corpus.train),
                 "holdout": _label_quality(self.corpus.holdout),
             },
             "training_metrics": None if metrics is None else asdict(metrics),
             "aggregate": {
-                "model": validation.equity.as_dict(),
-                "heads_up_scalar": aggregate_scalar,
-                "empirical_prior": overall_baseline.as_dict(),
-                "empirical_prior_heads_up_scalar": aggregate_baseline_scalar,
-                "brier_reduction": aggregate_reduction,
+                "outcome_model": validation.equity.as_dict(),
+                "expected_showdown_share": validation.expected_showdown_share.as_dict(),
+                "outcome_empirical_prior": overall_baseline.as_dict(),
+                "expected_showdown_share_empirical_prior": aggregate_baseline_share.as_dict(),
+                "outcome_brier_reduction": aggregate_reduction,
+                "expected_showdown_share_brier_reduction": aggregate_share_reduction,
             },
             "strata": strata,
             "acceptance": {

@@ -7,7 +7,7 @@ from copy import deepcopy
 import pytest
 
 from poker.game_state import HandState
-from poker.model import ACTION_NAMES, BET_SIZE_ACTIONS, MODEL_VERSION, TORCH_AVAILABLE, ModelConfig, PokerAgentModel
+from poker.model import ACTION_NAMES, BET_SIZE_ACTIONS, EQUITY_HEADS, MODEL_VERSION, TORCH_AVAILABLE, ModelConfig, PokerAgentModel
 from poker.observation import observation_for
 
 pytestmark = pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed; install with .[rl]")
@@ -68,13 +68,17 @@ def test_model_handles_two_three_and_five_player_sets_with_one_weight_set() -> N
     assert output.bet_size_logits.shape == (3, len(BET_SIZE_ACTIONS))
     assert output.value.shape == (3,)
     assert output.equity_logits.shape == (3, 3)
+    assert output.expected_showdown_share_logit.shape == (3,)
+    assert output.expected_showdown_share.shape == (3,)
     assert torch.isfinite(output.action_logits).all()
     assert torch.isfinite(output.bet_size_logits).all()
     assert torch.isfinite(output.value).all()
     assert torch.isfinite(output.equity_logits).all()
+    assert torch.isfinite(output.expected_showdown_share).all()
     assert torch.allclose(output.action_probabilities.sum(dim=-1), torch.ones(3))
     assert torch.allclose(output.bet_size_probabilities.sum(dim=-1), torch.ones(3))
     assert torch.allclose(output.equity_probabilities.sum(dim=-1), torch.ones(3))
+    assert torch.all((output.expected_showdown_share >= 0.0) & (output.expected_showdown_share <= 1.0))
 
 
 def test_masks_zero_illegal_probabilities_and_inference_never_selects_them() -> None:
@@ -87,6 +91,7 @@ def test_masks_zero_illegal_probabilities_and_inference_never_selects_them() -> 
     assert torch.equal(output.bet_size_probabilities[0][~output.bet_size_mask[0]], torch.zeros_like(output.bet_size_probabilities[0][~output.bet_size_mask[0]]))
     decision = model.infer(observation)
     assert observation["legal_action_mask"][decision.action]
+    assert 0.0 <= decision.expected_showdown_share <= 1.0
 
 
 def test_inference_is_deterministic_and_checkpoint_is_versioned(tmp_path) -> None:
@@ -142,11 +147,12 @@ def test_history_encoder_distinguishes_action_order() -> None:
     assert not torch.allclose(_history_representation(model, first), _history_representation(model, second))
 
 
-def test_model_version_rejects_pre_role_and_order_encoding_checkpoints() -> None:
+def test_model_version_rejects_v2_checkpoint_without_expected_showdown_share_head() -> None:
     model = PokerAgentModel(ModelConfig(embedding_dim=16, hidden_dim=32, history_layers=1, attention_heads=4))
     metadata = model.checkpoint_metadata()
-    metadata["model_version"] = "1.0"
+    metadata["model_version"] = "2.0"
 
-    assert MODEL_VERSION == "2.0"
+    assert MODEL_VERSION == "3.0"
+    assert EQUITY_HEADS == ("outcome_v1", "expected_showdown_share_v1")
     with pytest.raises(ValueError, match="incompatible checkpoint model_version"):
         model._validate_metadata(metadata)

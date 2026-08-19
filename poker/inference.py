@@ -9,6 +9,7 @@ fallback for a fresh checkout; it is not an additional training algorithm.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Mapping, Protocol
 
 from .betting import Action
@@ -16,15 +17,45 @@ from .bots import AggroBot, CallingStationBot, PokerBot, RandomBot, RuleBot, Tig
 from .model import BET_SIZE_ACTIONS, PokerAgentModel
 
 
+EXPECTED_SHOWDOWN_SHARE_PROTOCOL = "active_hands_expected_showdown_share_v1"
+"""Expected equal-pot share at showdown among the currently active hands."""
+
+HEURISTIC_HAND_STRENGTH_PROTOCOL = "heuristic_hand_strength_v1"
+"""Cheap visible-card strength proxy; deliberately not model equity."""
+
+
+@dataclass(frozen=True)
+class ScalarMetric:
+    """One explicitly named scalar emitted beside the outcome distribution.
+
+    A scalar must always state what it means.  In particular, multiway
+    ``win/tie/loss`` cannot honestly be collapsed to ``win + 0.5 * tie``.
+    """
+
+    name: str
+    value: float
+    protocol: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {"name": self.name, "value": self.value, "protocol": self.protocol}
+
+
 @dataclass(frozen=True)
 class InferenceResponse:
-    """JSON-safe model explanation attached to one selected action."""
+    """JSON-safe policy explanation attached to one selected action.
+
+    ``equity`` remains the categorical ``win/tie/loss`` outcome head for
+    compatibility.  Any displayed scalar is carried separately in
+    :attr:`scalar_metric`, with a protocol that prevents a caller from
+    mistaking a heuristic or a heads-up convention for multiway pot share.
+    """
 
     action: str
     action_probabilities: dict[str, float]
     bet_size_probabilities: dict[str, float]
     equity: dict[str, float]
     value_bb: float
+    scalar_metric: ScalarMetric | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -33,6 +64,7 @@ class InferenceResponse:
             "bet_size_probabilities": dict(self.bet_size_probabilities),
             "equity": dict(self.equity),
             "value_bb": self.value_bb,
+            "scalar_metric": None if self.scalar_metric is None else self.scalar_metric.as_dict(),
         }
 
 
@@ -101,14 +133,17 @@ class CheckpointInferenceService:
 
     def decide(self, observation: Mapping[str, object]) -> InferenceResponse:
         decision = self.model.infer(observation)
-        equity = dict(decision.equity)
-        equity["total"] = equity["win"] + 0.5 * equity["tie"]
         return InferenceResponse(
             action=decision.action,
             action_probabilities=dict(decision.action_probabilities),
             bet_size_probabilities=dict(decision.bet_size_probabilities),
-            equity=equity,
+            equity=dict(decision.equity),
             value_bb=decision.value_bb,
+            scalar_metric=ScalarMetric(
+                name="expected_showdown_share",
+                value=float(decision.expected_showdown_share),
+                protocol=EXPECTED_SHOWDOWN_SHARE_PROTOCOL,
+            ),
         )
 
 
@@ -132,8 +167,13 @@ class BotInferenceService:
             action=selected.value,
             action_probabilities=action_probabilities,
             bet_size_probabilities=bet_size_probabilities,
-            equity={"win": strength, "tie": 0.0, "loss": 1.0 - strength, "total": strength},
+            equity={"win": strength, "tie": 0.0, "loss": 1.0 - strength},
             value_bb=(strength - 0.5) * float(observation["pot"]) / 100,
+            scalar_metric=ScalarMetric(
+                name="heuristic_hand_strength",
+                value=strength,
+                protocol=HEURISTIC_HAND_STRENGTH_PROTOCOL,
+            ),
         )
 
 
@@ -192,11 +232,31 @@ def validate_response(response: InferenceResponse, legal_actions: Mapping[str, b
         raise ValueError(f"inference returned unknown action {response.action!r}") from error
     if not legal_actions.get(action.value, False):
         raise ValueError(f"inference returned illegal action {action.value!r}")
-    for name in ("win", "tie", "loss", "total"):
+    for name in ("win", "tie", "loss"):
         if name not in response.equity:
             raise ValueError(f"inference equity has no {name!r}")
-    if abs(sum(response.equity[name] for name in ("win", "tie", "loss")) - 1.0) > 1e-5:
+    probabilities = tuple(float(response.equity[name]) for name in ("win", "tie", "loss"))
+    if any(not isfinite(value) or not 0.0 <= value <= 1.0 for value in probabilities):
+        raise ValueError("inference equity probabilities must be finite values in [0, 1]")
+    if abs(sum(probabilities) - 1.0) > 1e-5:
         raise ValueError("inference equity probabilities must sum to one")
-    expected_total = response.equity["win"] + 0.5 * response.equity["tie"]
-    if abs(response.equity["total"] - expected_total) > 1e-5:
-        raise ValueError("inference equity total is inconsistent")
+    metric = response.scalar_metric
+    if metric is None:
+        return
+    validate_scalar_metric(metric)
+
+
+def validate_scalar_metric(metric: ScalarMetric) -> None:
+    """Validate a scalar independently when loading a saved browser replay."""
+
+    if metric.name not in {"expected_showdown_share", "heuristic_hand_strength"}:
+        raise ValueError(f"inference scalar metric has unknown name {metric.name!r}")
+    expected_protocol = (
+        EXPECTED_SHOWDOWN_SHARE_PROTOCOL
+        if metric.name == "expected_showdown_share"
+        else HEURISTIC_HAND_STRENGTH_PROTOCOL
+    )
+    if metric.protocol != expected_protocol:
+        raise ValueError(f"inference scalar metric has incompatible protocol {metric.protocol!r}")
+    if not isfinite(metric.value) or not 0.0 <= metric.value <= 1.0:
+        raise ValueError("inference scalar metric must be finite and in [0, 1]")

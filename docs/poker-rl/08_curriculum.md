@@ -35,9 +35,9 @@ immutable evidence artifacts и не может быть включён вмес
 paired scratch rung. Это ограничение evidence, а не разрешение считать
 transfer доказанно лучшим scratch.
 
-Переходы C--E не автоматизируются до появления multiway expected-share head и
-настоящего transfer-vs-scratch сравнения при одинаковом бюджете. Текущая
-`win + 0.5 × tie` калибровка применима как scalar gate только в heads-up.
+Переходы C--E пока не автоматизируются: multiway-корректная
+`expected_showdown_share` head уже есть, но ещё нужен настоящий
+transfer-vs-scratch rung при одинаковом бюджете и отдельный multiway gate.
 
 ## Критерий приёмки
 

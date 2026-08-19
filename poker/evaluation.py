@@ -18,7 +18,12 @@ from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from .betting import Action, RAISE_ACTIONS
-from .equity import EquityMetrics, equity_metrics
+from .equity import (
+    EquityMetrics,
+    ExpectedShowdownShareMetrics,
+    equity_metrics,
+    expected_showdown_share_metrics,
+)
 from .game_state import HandState
 from .league import ModelPolicy
 from .model import ACTION_NAMES, BET_SIZE_ACTIONS, TORCH_AVAILABLE
@@ -107,7 +112,7 @@ class SanityScenarioResult:
     name: str
     legal: bool
     finite: bool
-    equity: float | None
+    expected_showdown_share: float | None
     selected_action: str | None
     note: str
 
@@ -136,12 +141,16 @@ class MatchupReport:
     statistics: PokerStyleStatistics
     model_diagnostics: ModelDiagnostics
     equity: EquityMetrics | None
+    expected_showdown_share: ExpectedShowdownShareMetrics | None
 
     def as_dict(self) -> dict[str, object]:
         result = asdict(self)
         result["statistics"] = self.statistics.as_dict()
         result["model_diagnostics"] = self.model_diagnostics.as_dict()
         result["equity"] = None if self.equity is None else self.equity.as_dict()
+        result["expected_showdown_share"] = (
+            None if self.expected_showdown_share is None else self.expected_showdown_share.as_dict()
+        )
         return result
 
 
@@ -167,7 +176,9 @@ class EvaluationSuiteReport:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": "1.2",
+            "schema_version": "2.0",
+            "outcome_protocol": "fixed_deal_virtual_showdown_outcome_v1",
+            "scalar_metric_protocol": "active_hands_expected_showdown_share_v1",
             "candidate": self.candidate,
             "config": asdict(self.config),
             "aggregate_bb_per_100": self.aggregate_bb_per_100,
@@ -221,6 +232,8 @@ class _ModelAccumulator:
     decisions: int = 0
     equity_predictions: list[tuple[float, float, float]] | None = None
     equity_targets: list[tuple[float, float, float]] | None = None
+    expected_showdown_share_predictions: list[float] | None = None
+    expected_showdown_share_targets: list[float] | None = None
 
 
 def evaluate_suite(
@@ -275,7 +288,18 @@ def _evaluate_matchup(
     hand_pnl: list[float] = []
     winning_hands = 0
     tied_hands = 0
-    model_accumulator = _ModelAccumulator([], [], equity_predictions=[], equity_targets=[]) if isinstance(candidate_template, ModelPolicy) else None
+    model_accumulator = (
+        _ModelAccumulator(
+            [],
+            [],
+            equity_predictions=[],
+            equity_targets=[],
+            expected_showdown_share_predictions=[],
+            expected_showdown_share_targets=[],
+        )
+        if isinstance(candidate_template, ModelPolicy)
+        else None
+    )
 
     for hand_index in range(config.hands_per_opponent):
         # Button remains stable; rotating the candidate's physical seat rotates
@@ -309,7 +333,7 @@ def _evaluate_matchup(
         pfr = False
         three_bet = False
         preflop_raises = 0
-        model_rows: list[tuple[int, tuple[float, float, float], float]] = []
+        model_rows: list[tuple[int, tuple[float, float, float], float, float]] = []
         while not state.complete:
             seat = state.actor
             if seat is None:
@@ -318,13 +342,13 @@ def _evaluate_matchup(
             policy = candidate_policy if seat == candidate_seat else opponent_policy
             is_candidate = seat == candidate_seat
             if is_candidate and model_accumulator is not None:
-                action, probabilities, equity, value = _model_action(policy, observation)
+                action, probabilities, equity, expected_showdown_share, value = _model_action(policy, observation)
                 model_accumulator.decisions += 1
                 model_accumulator.entropy.append(_entropy(probabilities))
                 legal = observation["legal_actions"]
                 if not bool(legal.get(action.value, False)):
                     model_accumulator.masked_selected += 1
-                model_rows.append((len(trace.decisions), equity, value))
+                model_rows.append((len(trace.decisions), equity, expected_showdown_share, value))
             else:
                 action = policy.select_action(observation, observation["legal_actions"])
             if not isinstance(action, Action):
@@ -366,14 +390,24 @@ def _evaluate_matchup(
         style.pfr_hands += pfr
         style.three_bets += three_bet
         if model_accumulator is not None:
-            for decision_index, prediction, value in model_rows:
+            for decision_index, prediction, share_prediction, value in model_rows:
                 decision = trace.decisions[decision_index]
-                if decision.equity_target is None or decision.terminal_pnl_bb is None:
+                if (
+                    decision.equity_target is None
+                    or decision.expected_showdown_share_target is None
+                    or decision.terminal_pnl_bb is None
+                ):
                     raise RuntimeError("completed evaluation trace has no labels")
                 assert model_accumulator.equity_predictions is not None
                 assert model_accumulator.equity_targets is not None
                 model_accumulator.equity_predictions.append(prediction)
                 model_accumulator.equity_targets.append(tuple(float(value) for value in decision.equity_target))
+                assert model_accumulator.expected_showdown_share_predictions is not None
+                assert model_accumulator.expected_showdown_share_targets is not None
+                model_accumulator.expected_showdown_share_predictions.append(share_prediction)
+                model_accumulator.expected_showdown_share_targets.append(
+                    float(decision.expected_showdown_share_target)
+                )
                 model_accumulator.value_errors.append(value - decision.terminal_pnl_bb)
 
     diagnostics = _model_diagnostics(model_accumulator)
@@ -382,6 +416,13 @@ def _evaluate_matchup(
         equity = equity_metrics(
             model_accumulator.equity_predictions,
             model_accumulator.equity_targets or (),
+            bins=config.calibration_bins,
+        )
+    expected_showdown_share = None
+    if model_accumulator is not None and model_accumulator.expected_showdown_share_predictions:
+        expected_showdown_share = expected_showdown_share_metrics(
+            model_accumulator.expected_showdown_share_predictions,
+            model_accumulator.expected_showdown_share_targets or (),
             bins=config.calibration_bins,
         )
     hands = config.hands_per_opponent
@@ -420,6 +461,7 @@ def _evaluate_matchup(
         statistics=_style_statistics(style),
         model_diagnostics=diagnostics,
         equity=equity,
+        expected_showdown_share=expected_showdown_share,
     )
 
 
@@ -445,7 +487,10 @@ def _seed_evaluation_policy(policy: EvaluablePolicy, seed: int) -> None:
         rng.seed(seed)
 
 
-def _model_action(policy: EvaluablePolicy, observation: Mapping[str, object]) -> tuple[Action, tuple[float, ...], tuple[float, float, float], float]:
+def _model_action(
+    policy: EvaluablePolicy,
+    observation: Mapping[str, object],
+) -> tuple[Action, tuple[float, ...], tuple[float, float, float], float, float]:
     if not isinstance(policy, ModelPolicy):  # Defensive: called only after the check above.
         raise TypeError("model diagnostics require ModelPolicy")
     if not TORCH_AVAILABLE:
@@ -467,6 +512,7 @@ def _model_action(policy: EvaluablePolicy, observation: Mapping[str, object]) ->
         Action(action_name),
         tuple(float(item) for item in output.action_probabilities[0].tolist()),
         tuple(float(item) for item in output.equity_probabilities[0].tolist()),  # type: ignore[return-value]
+        float(output.expected_showdown_share[0].item()),
         float(output.value[0].item()),
     )
 
@@ -532,10 +578,17 @@ def run_sanity_checks(policy: EvaluablePolicy) -> tuple[SanityScenarioResult, ..
     for name, hole_cards, board, note in scenarios:
         observation = _scenario_observation(original, hole_cards, board, name)
         try:
-            action, probabilities, equity, _ = _model_action(policy, observation)
+            action, probabilities, equity, expected_showdown_share, _ = _model_action(policy, observation)
             legal = bool(observation["legal_actions"].get(action.value, False))
-            finite = all(isfinite(value) and value >= 0.0 for value in (*probabilities, *equity)) and abs(sum(equity) - 1.0) < 1e-5
-            results.append(SanityScenarioResult(name, legal, finite, equity[0] + 0.5 * equity[1], action.value, note))
+            finite = (
+                all(isfinite(value) and value >= 0.0 for value in (*probabilities, *equity))
+                and abs(sum(equity) - 1.0) < 1e-5
+                and isfinite(expected_showdown_share)
+                and 0.0 <= expected_showdown_share <= 1.0
+            )
+            results.append(
+                SanityScenarioResult(name, legal, finite, expected_showdown_share, action.value, note)
+            )
         except Exception:
             results.append(SanityScenarioResult(name, False, False, None, None, note))
     return tuple(results)

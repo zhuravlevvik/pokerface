@@ -30,8 +30,8 @@ if TORCH_AVAILABLE:
     import torch
 
 
-TRANSITION_MANIFEST_VERSION = 1
-TRANSITION_REPORT_VERSION = 1
+TRANSITION_MANIFEST_VERSION = 2
+TRANSITION_REPORT_VERSION = 2
 HU_BASELINES = ("rule", "tight", "aggro", "calling_station", "random")
 
 
@@ -280,6 +280,7 @@ class CurriculumTransitionEvaluator:
             self._publish_transfer(candidate, transfer_path, global_step=self._source_global_decisions(source_path))
         report = {
             "transition_report_version": TRANSITION_REPORT_VERSION,
+            "scalar_metric_protocol": "active_hands_expected_showdown_share_v1",
             "decision_key": key,
             "iteration": iteration,
             "source": {
@@ -356,10 +357,12 @@ class CurriculumTransitionEvaluator:
             raise ValueError("transition evaluation lacks required baseline or prior matchup")
         baseline_score = _aggregate_bb_per_100(baselines)
         prior_match = prior[0]
-        equity = [item.equity for item in suite.matchups]
-        if any(item is None for item in equity):
-            raise ValueError("transition evaluation has no model equity diagnostics")
-        max_ece = max(item.expected_calibration_error for item in equity if item is not None)
+        showdown_share = [item.expected_showdown_share for item in suite.matchups]
+        if any(item is None for item in showdown_share):
+            raise ValueError("transition evaluation has no expected-showdown-share diagnostics")
+        max_ece = max(
+            item.expected_calibration_error for item in showdown_share if item is not None
+        )
         illegal_count = sum(item.model_diagnostics.illegal_action_count for item in suite.matchups)
         sanity_passed = all(item.legal and item.finite for item in suite.sanity_checks)
         previous_ok = prior_match.bb_per_100_ci95_low >= self.config.minimum_prior_ci95_low

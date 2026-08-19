@@ -7,7 +7,16 @@ import json
 import pytest
 
 from poker.cards import Card, Deck
-from poker.equity import EquitySnapshot, EquityTarget, capture_equity_snapshot, equity_cross_entropy, equity_metrics, generate_equity_target
+from poker.equity import (
+    EquitySnapshot,
+    EquityTarget,
+    capture_equity_snapshot,
+    equity_cross_entropy,
+    equity_metrics,
+    expected_showdown_share_binary_cross_entropy,
+    expected_showdown_share_metrics,
+    generate_equity_target,
+)
 from poker.game_state import HandState
 from poker.simulator import BatchedHoldemEnvironment
 
@@ -42,6 +51,24 @@ def test_river_target_is_exact_for_win_tie_and_loss(snapshot: EquitySnapshot, ex
     assert target.exact is True
     assert target.samples == 1
     assert target.probabilities == expected
+    assert target.expected_showdown_share == pytest.approx(expected[0] + 0.5 * expected[1])
+
+
+def test_multiway_tie_uses_fractional_active_hand_showdown_share() -> None:
+    # Every active hand plays the royal flush on the board.  This is a
+    # three-way virtual showdown tie, so hero share is 1/3, not 1/2.
+    snapshot = EquitySnapshot(
+        hero_seat=0,
+        hero_hole_cards=_cards("Ah", "Kd"),  # type: ignore[arg-type]
+        opponent_hole_cards=(_cards("Qc", "Jd"), _cards("2c", "3d")),  # type: ignore[arg-type]
+        board=_cards("As", "Ks", "Qs", "Js", "Ts"),
+        remaining_deck=(),
+    )
+
+    target = generate_equity_target(snapshot, samples=1)
+
+    assert target.probabilities == (0.0, 1.0, 0.0)
+    assert target.expected_showdown_share == pytest.approx(1.0 / 3.0)
 
 
 def test_pre_river_target_is_soft_reproducible_and_uses_runouts() -> None:
@@ -130,6 +157,19 @@ def test_equity_metrics_uses_displayed_win_plus_half_tie_for_calibration() -> No
     assert populated.mean_target == pytest.approx(0.7)
 
 
+def test_expected_showdown_share_metrics_calibrate_fractional_multiway_target() -> None:
+    report = expected_showdown_share_metrics([1.0 / 3.0, 1.0, 0.0], [1.0 / 3.0, 1.0, 0.0], bins=3)
+
+    assert report.samples == 3
+    # Soft fractional targets retain their Bernoulli entropy even for perfect
+    # predictions; Brier/calibration, not raw logloss, are zero here.
+    assert report.logloss > 0.0
+    assert report.brier_score == pytest.approx(0.0)
+    assert report.mean_absolute_error == pytest.approx(0.0)
+    assert report.root_mean_squared_error == pytest.approx(0.0)
+    assert report.expected_calibration_error == pytest.approx(0.0)
+
+
 def test_equity_cross_entropy_accepts_soft_targets_when_torch_is_installed() -> None:
     torch = pytest.importorskip("torch")
     logits = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
@@ -139,6 +179,18 @@ def test_equity_cross_entropy_accepts_soft_targets_when_torch_is_installed() -> 
     loss.backward()
 
     assert loss.item() == pytest.approx(1.0986123)
+    assert logits.grad is not None
+
+
+def test_expected_showdown_share_binary_cross_entropy_accepts_fractional_target() -> None:
+    torch = pytest.importorskip("torch")
+    logits = torch.tensor([0.0], requires_grad=True)
+    targets = torch.tensor([1.0 / 3.0])
+
+    loss = expected_showdown_share_binary_cross_entropy(logits, targets)
+    loss.backward()
+
+    assert loss.item() == pytest.approx(0.69314718)
     assert logits.grad is not None
 
 

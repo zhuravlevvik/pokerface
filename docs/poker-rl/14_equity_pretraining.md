@@ -24,11 +24,12 @@ equity-head до PPO и сохраняет отчёт, по которому м�
 Конфиг фиксирует непересекающиеся диапазоны seed для train/holdout, смесь
 baseline-политик, число Monte-Carlo досдач, архитектуру, optimizer, число
 epoch и acceptance gates. По умолчанию поведенческое клонирование и value
-warm-up выключены: основной loss — soft cross-entropy equity-head.
+warm-up выключены: используются soft cross-entropy outcome-head и soft BCE
+отдельной expected-showdown-share head.
 
-Исполняемый pretraining runner допускает только stages A/B. Категории
-`win/tie/loss` осмысленны и в multiway, но текущий scalar calibration
-`win + 0.5 × tie` является ожидаемой долей банка только в heads-up.
+Исполняемый pretraining runner пока допускает только stages A/B как небольшой
+warm-up. Сами категории и отдельный expected-showdown-share scalar корректны
+и в multiway.
 
 ## Артефакты
 
@@ -38,12 +39,14 @@ warm-up выключены: основной loss — soft cross-entropy equity-
   оппонентов, undealt deck или private snapshots;
 - `checkpoints/*.pt` и `latest.pt` — model, optimizer, epoch/step, RNG,
   config/corpus hashes и label protocol;
-- `report.json` — logloss, multiclass Brier, ECE, heads-up MAE/RMSE и
+- `report.json` — outcome logloss/multiclass Brier и scalar
+  logloss/Brier/MAE/RMSE/ECE с протоколом
+  `active_hands_expected_showdown_share_v1`, а также
   сравнение с train-only empirical prior в разрезах
   street × players × active opponents;
 - `manifest.json` — список опубликованных checkpoint'ов.
 
-Метка имеет явную семантику `fixed_deal_virtual_showdown_v1`: при её
+Метка имеет явную семантику `fixed_deal_expected_showdown_share_v2`: при её
 построении известны фактически сданные карты оппонентов. Эти карты никогда
 не входят в observation или JSONL, но target не следует называть range equity.
 Audit `hand_seed` хранится вне observation и позволяет оператору полностью

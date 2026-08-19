@@ -27,7 +27,7 @@ from .observation import OBSERVATION_VERSION
 from .traces import EQUITY_LABEL_PROTOCOL
 
 
-PRETRAINING_CORPUS_SCHEMA_VERSION = "1.0"
+PRETRAINING_CORPUS_SCHEMA_VERSION = "2.0"
 """Version of the on-disk JSONL corpus contract."""
 
 BASELINE_BOT_NAMES = ("rule", "tight", "aggro", "calling_station", "random")
@@ -211,6 +211,14 @@ def _validate_split_records(
             or example.label_protocol != EQUITY_LABEL_PROTOCOL
         ):
             raise ValueError(f"{split} row has invalid equity label provenance")
+        expected_share = example.expected_showdown_share_target
+        if (
+            isinstance(expected_share, bool)
+            or not isinstance(expected_share, (int, float))
+            or not isfinite(float(expected_share))
+            or not 0.0 <= float(expected_share) <= 1.0
+        ):
+            raise ValueError(f"{split} row has an invalid expected showdown-share target")
         if (not example.equity_exact and example.equity_samples != requested_samples) or (
             example.equity_exact and example.equity_samples > requested_samples
         ):
@@ -282,25 +290,21 @@ def _stable_number(value: Any) -> int:
     return int.from_bytes(sha256(payload.encode("utf-8")).digest()[:8], "big")
 
 
-def equity_bucket(
-    target: Sequence[float], *, boundaries: Sequence[float] = DEFAULT_EQUITY_BUCKETS, active_player_count: int = 2
-) -> str:
-    """Return a stable target bucket without claiming a multiway pot share.
+def equity_bucket(expected_showdown_share: float, *, boundaries: Sequence[float] = DEFAULT_EQUITY_BUCKETS) -> str:
+    """Return a stable bucket for expected showdown share only.
 
-    Heads-up uses the conventional ``win + 0.5 * tie`` score.  In multiway,
-    where that is *not* an expected pot share, this uses win probability only.
-    Buckets are left-inclusive and the final bucket includes one.
+    The scalar is averaged across active showdown hands and is explicitly not
+    a current-pot or side-pot share.  Buckets are left-inclusive and the final
+    bucket includes one.
     """
 
-    if len(target) != 3 or any(not isinstance(value, (int, float)) for value in target):
-        raise ValueError("equity target must contain win, tie, and loss")
+    if isinstance(expected_showdown_share, bool) or not isinstance(expected_showdown_share, (int, float)):
+        raise ValueError("expected showdown share must be numeric")
     if len(boundaries) < 2 or boundaries[0] != 0.0 or boundaries[-1] != 1.0 or any(left >= right for left, right in zip(boundaries, boundaries[1:])):
         raise ValueError("equity bucket boundaries must increase from 0.0 to 1.0")
-    if active_player_count < 2:
-        raise ValueError("active_player_count must be at least two")
-    value = float(target[0]) + (0.5 * float(target[1]) if active_player_count == 2 else 0.0)
+    value = float(expected_showdown_share)
     if not 0.0 <= value <= 1.0:
-        raise ValueError("equity must be in [0, 1]")
+        raise ValueError("expected showdown share must be in [0, 1]")
     for lower, upper in zip(boundaries, boundaries[1:]):
         if value < upper or upper == 1.0:
             return f"{lower:.1f}-{upper:.1f}"
@@ -317,7 +321,10 @@ def stratum_for(example: PretrainingExample) -> PretrainingStratum:
     street, position, active = cards.get("street"), hero.get("position"), table.get("active_player_count")
     if not isinstance(street, str) or not isinstance(position, str) or isinstance(active, bool) or not isinstance(active, int):
         raise ValueError("pretraining example lacks safe stratum fields")
-    return PretrainingStratum(street, active, position, equity_bucket(example.equity_target, active_player_count=active), example.selected_action)
+    expected_share = example.expected_showdown_share_target
+    if expected_share is None:
+        raise ValueError("pretraining example has no expected showdown-share target")
+    return PretrainingStratum(street, active, position, equity_bucket(expected_share), example.selected_action)
 
 
 def generate_pretraining_corpus(
@@ -522,6 +529,7 @@ def _example_record(split: str, record: CorpusRecord) -> dict[str, Any]:
         "observation": record.example.observation,
         "selected_action": record.example.selected_action,
         "equity_target": list(record.example.equity_target),
+        "expected_showdown_share_target": record.example.expected_showdown_share_target,
         "terminal_pnl_bb": record.example.terminal_pnl_bb,
         "equity_samples": record.example.equity_samples,
         "equity_exact": record.example.equity_exact,
@@ -531,10 +539,15 @@ def _example_record(split: str, record: CorpusRecord) -> dict[str, Any]:
 
 
 def _parse_metadata(data: Mapping[str, Any]) -> tuple[CurriculumStage, SeedRange, SeedRange, tuple[str, ...], int, int]:
-    if data.get("record_type") != "metadata" or data.get("schema_version") != PRETRAINING_CORPUS_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if schema_version == "1.0":
+        raise ValueError("pretraining corpus schema v1 is unsupported: regenerate labels with expected showdown share")
+    if data.get("record_type") != "metadata" or schema_version != PRETRAINING_CORPUS_SCHEMA_VERSION:
         raise ValueError("incompatible pretraining corpus metadata")
     if data.get("observation_schema_version") != OBSERVATION_VERSION:
         raise ValueError("incompatible observation schema")
+    if data.get("equity_label_protocol") == "fixed_deal_virtual_showdown_v1":
+        raise ValueError("pretraining corpus label protocol v1 is unsupported: expected showdown-share labels are required")
     if data.get("equity_label_protocol") != EQUITY_LABEL_PROTOCOL:
         raise ValueError("incompatible equity label protocol")
     try:
@@ -557,6 +570,7 @@ def _parse_example_record(data: Mapping[str, Any], stage: CurriculumStage) -> tu
         raise ValueError("incompatible pretraining example record")
     split, encoded_stage, observation = data.get("split"), data.get("stage"), data.get("observation")
     action, target, pnl, encoded_stratum = data.get("selected_action"), data.get("equity_target"), data.get("terminal_pnl_bb"), data.get("stratum")
+    expected_share = data.get("expected_showdown_share_target")
     hand_id, seed, policy = data.get("hand_id"), data.get("hand_seed"), data.get("behavior_policy")
     samples, exact, protocol = data.get("equity_samples"), data.get("equity_exact"), data.get("label_protocol")
     if split not in {"train", "holdout"} or encoded_stage != stage.value or not isinstance(observation, Mapping) or not isinstance(action, str):
@@ -565,6 +579,8 @@ def _parse_example_record(data: Mapping[str, Any], stage: CurriculumStage) -> tu
         raise ValueError("pretraining example has invalid equity target")
     if any(not isfinite(float(value)) or float(value) < 0.0 for value in target) or abs(sum(float(value) for value in target) - 1.0) > 1e-8:
         raise ValueError("pretraining example has invalid equity target")
+    if isinstance(expected_share, bool) or not isinstance(expected_share, (int, float)) or not isfinite(float(expected_share)) or not 0.0 <= float(expected_share) <= 1.0:
+        raise ValueError("pretraining example has invalid expected showdown-share target")
     if isinstance(pnl, bool) or not isinstance(pnl, (int, float)) or not isinstance(encoded_stratum, Mapping):
         raise ValueError("pretraining example has invalid labels")
     if isinstance(hand_id, bool) or not isinstance(hand_id, int) or isinstance(seed, bool) or not isinstance(seed, int):
@@ -573,7 +589,7 @@ def _parse_example_record(data: Mapping[str, Any], stage: CurriculumStage) -> tu
         raise ValueError("pretraining example has invalid label provenance")
     example = PretrainingExample(
         dict(observation), action, tuple(float(value) for value in target), float(pnl), stage,
-        hand_id, seed, samples, exact, protocol, policy,
+        hand_id, seed, samples, exact, protocol, policy, float(expected_share),
     )
     _validate_player_safe_example(example)
     stratum = PretrainingStratum.from_dict(encoded_stratum)

@@ -104,6 +104,10 @@ class CurriculumConfig:
 class StageEvaluation:
     """Trainer-produced, comparable result required before advancing.
 
+    ``equity_calibration_error`` is a compatibility name for the explicitly
+    protocolled expected-showdown-share ECE in automated evaluators; it must
+    never be populated from ``win + 0.5 * tie`` for a multiway stage.
+
     ``transfer_bb_per_100`` and ``scratch_bb_per_100`` use the same fixed
     seeds, opponent pool, positions, and step budget.  This is the required
     evidence that transfer is better than starting the target stage from zero.
@@ -275,6 +279,15 @@ class PretrainingExample:
     equity_exact: bool | None = None
     label_protocol: str | None = None
     behavior_policy: str | None = None
+    # Expected share of a showdown among active hands, not an awarded pot share.
+    # Appended to keep all older positional construction valid.
+    expected_share_target: float | None = None
+
+    @property
+    def expected_showdown_share_target(self) -> float | None:
+        """Explicit semantic alias for the Stage 4 scalar label."""
+
+        return self.expected_share_target
 
 
 class TracePretrainingDataset(Sequence[PretrainingExample]):
@@ -304,6 +317,9 @@ class TracePretrainingDataset(Sequence[PretrainingExample]):
                 hand_id = record.get("hand_id")
                 seed = record.get("seed")
                 label_protocol = record.get("label_protocol")
+                expected_share = record.get("expected_showdown_share_target")
+                if isinstance(expected_share, bool) or not isinstance(expected_share, (int, float)):
+                    raise ValueError("terminal trace has no expected showdown-share supervision")
                 examples.append(
                     PretrainingExample(
                         record["observation"],
@@ -316,6 +332,8 @@ class TracePretrainingDataset(Sequence[PretrainingExample]):
                         samples if isinstance(samples, int) else None,
                         exact if isinstance(exact, bool) else None,
                         label_protocol if isinstance(label_protocol, str) else None,
+                        None,
+                        float(expected_share),
                     )
                 )
         return cls(examples)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -14,6 +15,7 @@ from poker.pretraining_data import (
     equity_bucket,
     generate_pretraining_corpus,
     load_pretraining_corpus,
+    stratum_for,
     write_pretraining_corpus,
 )
 
@@ -56,11 +58,12 @@ def test_jsonl_round_trip_is_atomic_format_with_auditable_metadata(tmp_path) -> 
     assert load_pretraining_corpus(path) == corpus
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["schema_version"] == PRETRAINING_CORPUS_SCHEMA_VERSION
-    assert rows[0]["equity_label_protocol"] == "fixed_deal_virtual_showdown_v1"
+    assert rows[0]["equity_label_protocol"] == "fixed_deal_expected_showdown_share_v2"
     assert rows[0]["train_equity_samples"] == 1
     assert rows[0]["holdout_equity_samples"] == 1
     example = rows[1]
-    assert {"hand_id", "hand_seed", "behavior_policy", "street", "table_player_count", "active_opponent_count", "equity_samples", "equity_exact", "label_protocol"} <= set(example)
+    assert {"hand_id", "hand_seed", "behavior_policy", "street", "table_player_count", "active_opponent_count", "equity_samples", "equity_exact", "label_protocol", "expected_showdown_share_target"} <= set(example)
+    assert 0.0 <= example["expected_showdown_share_target"] <= 1.0
 
 
 def test_serialized_rows_do_not_contain_opponent_hole_cards_or_private_deck(tmp_path) -> None:
@@ -112,10 +115,17 @@ def test_holdout_can_use_less_noisy_equity_labels_than_train() -> None:
     assert corpus.equity_samples is None
 
 
-def test_multiway_bucket_uses_win_probability_not_heads_up_tie_score() -> None:
-    # In a three-way hand a tie is not treated as a fixed half-pot share.
-    assert equity_bucket((0.0, 1.0, 0.0), active_player_count=2) == "0.4-0.6"
-    assert equity_bucket((0.0, 1.0, 0.0), active_player_count=3) == "0.0-0.2"
+def test_strata_bucket_uses_expected_showdown_share_only() -> None:
+    corpus = _corpus()
+    assert equity_bucket(0.5) == "0.4-0.6"
+    assert equity_bucket(0.0) == "0.0-0.2"
+    for record in corpus.train:
+        assert record.example.expected_showdown_share_target is not None
+        assert record.stratum.equity_bucket == equity_bucket(record.example.expected_showdown_share_target)
+    changed = replace(corpus.train[0].example, expected_share_target=0.0)
+    assert stratum_for(changed).equity_bucket == "0.0-0.2"
+    with pytest.raises(ValueError, match="expected showdown share"):
+        equity_bucket((0.0, 1.0, 0.0))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -124,6 +134,7 @@ def test_multiway_bucket_uses_win_probability_not_heads_up_tie_score() -> None:
         ("split", "holdout", "outside declared split"),
         ("equity_samples", 2, "sample count contradicts"),
         ("equity_target", [-0.1, 0.1, 1.0], "invalid equity target"),
+        ("expected_showdown_share_target", 1.1, "invalid expected showdown-share target"),
     ],
 )
 def test_loader_rejects_split_contamination_and_false_label_provenance(tmp_path, field, value, message) -> None:
@@ -134,4 +145,21 @@ def test_loader_rejects_split_contamination_and_false_label_provenance(tmp_path,
     path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        load_pretraining_corpus(path)
+
+
+def test_loader_explicitly_rejects_v1_corpus(tmp_path) -> None:
+    path = tmp_path / "legacy-v1.jsonl"
+    write_pretraining_corpus(_corpus(), path)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["schema_version"] = "1.0"
+    rows[0]["equity_label_protocol"] = "fixed_deal_virtual_showdown_v1"
+    path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema v1 is unsupported"):
+        load_pretraining_corpus(path)
+
+    rows[0]["schema_version"] = PRETRAINING_CORPUS_SCHEMA_VERSION
+    path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="label protocol v1 is unsupported"):
         load_pretraining_corpus(path)

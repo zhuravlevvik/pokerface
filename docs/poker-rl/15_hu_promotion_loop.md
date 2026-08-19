@@ -37,8 +37,9 @@ Stage 2 запускает PPO от pretraining checkpoint и автоматич
 
 Технические значения CI по умолчанию намеренно мягкие. Перед длительным run
 их нужно зафиксировать по pilot-оценке и не менять между кандидатами.
-Promotion сейчас разрешён только для heads-up stages A/B: multiway ещё не
-имеет корректной expected-share метки для scalar equity gate.
+Promotion сейчас разрешён только для heads-up stages A/B. Корректная
+multiway expected-showdown-share метка уже реализована, но отдельный
+multiway promotion protocol с heterogeneous seats ещё не введён.
 
 ## Протокол
 
